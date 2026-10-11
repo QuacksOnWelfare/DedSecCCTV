@@ -4,6 +4,24 @@
 
 # DedSec CCTV
 
+**A free, open-source CCTV viewer for Windows: watch live public feeds and your own cameras on one multi-camera wall.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6.svg?logo=windows&logoColor=white)](#download)
+[![UI: PyQt6](https://img.shields.io/badge/UI-PyQt6-41CD52.svg?logo=qt&logoColor=white)](https://pypi.org/project/PyQt6/)
+[![Player: VLC](https://img.shields.io/badge/Player-libVLC-FF8800.svg?logo=vlcmediaplayer&logoColor=white)](https://www.videolan.org/)
+[![Backend: FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Bug bounty: active](https://img.shields.io/badge/bug%20bounty-active-red.svg)](SECURITY.md)
+
+[Download](#download) · [Features](#features) · [Official app or self-host?](#two-ways-to-use-dedsec-cctv) · [Quick start](#quick-start) · [Roadmap](#updates--roadmap)
+
+
+<a href="SECURITY.md"><img src="docs/bug-bounty-banner.png" alt="Bug bounty program" width="100%" /></a>
+
+[Read the bounty rules](SECURITY.md) · [Report a vulnerability](https://github.com/QuacksOnWelfare/DedSecCCTV/security/advisories/new)
+
+
 </div>
 
 Full screen camera wall
@@ -53,21 +71,6 @@ Settings: Account
 Settings: About and updates
 
 <img src="docs/screenshots/settings.jpg" width="100%">
-
-<div align="center">
-
-**A free, open-source CCTV viewer for Windows: watch live public feeds and your own cameras on one multi-camera wall.**
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%E2%80%933.13-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6.svg?logo=windows&logoColor=white)](#download)
-[![UI: PyQt6](https://img.shields.io/badge/UI-PyQt6-41CD52.svg?logo=qt&logoColor=white)](https://pypi.org/project/PyQt6/)
-[![Player: VLC](https://img.shields.io/badge/Player-libVLC-FF8800.svg?logo=vlcmediaplayer&logoColor=white)](https://www.videolan.org/)
-[![Backend: FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-
-[Download](#download) · [Features](#features) · [Official app or self-host?](#two-ways-to-use-dedsec-cctv) · [Quick start](#quick-start) · [Roadmap](#updates--roadmap)
-
-</div>
 
 ---
 
