@@ -285,6 +285,10 @@ See [app/user_streams/README.txt](app/user_streams/README.txt) for details.
 Found a security issue? Please report it privately to the maintainers, for example through GitHub's
 *Report a vulnerability* feature if it's enabled, rather than opening a public issue.
 
+## Terms of use
+
+By using DedSec CCTV you agree to the [Terms of use](TERMS.md).
+
 ## Security and bug bounty
 
 Found a security problem? Please report it privately through GitHub's Report a vulnerability button on the Security tab, not in public issues or on Discord. See [SECURITY.md](SECURITY.md) for the full policy, what is in scope, and how the bug bounty works.
