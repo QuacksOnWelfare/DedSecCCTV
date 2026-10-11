@@ -4,6 +4,22 @@
 
 # DedSec CCTV
 
+<img src="docs/screenshots/fullscreen.jpg" alt="DedSec CCTV full screen wall" width="100%" />
+<br /><sub>Full screen camera wall</sub>
+
+</div>
+
+<table>
+<tr><td align="center" width="50%"><img src="docs/screenshots/wall.jpg" alt="Camera wall with four feeds live" width="100%" /><br /><sub>Camera wall with four feeds live</sub></td><td align="center" width="50%"><img src="docs/screenshots/add-cctv.jpg" alt="Add CCTV: browse the catalog by country" width="100%" /><br /><sub>Add CCTV: browse the catalog by country</sub></td></tr>
+<tr><td align="center" width="50%"><img src="docs/screenshots/login.jpg" alt="Sign in" width="100%" /><br /><sub>Sign in</sub></td><td align="center" width="50%"><img src="docs/screenshots/setup-2fa.jpg" alt="Optional two-factor setup" width="100%" /><br /><sub>Optional two-factor setup</sub></td></tr>
+<tr><td align="center" width="50%"><img src="docs/screenshots/wall-empty.jpg" alt="Empty wall ready for feeds" width="100%" /><br /><sub>Empty wall ready for feeds</sub></td><td align="center" width="50%"><img src="docs/screenshots/wall-ready.jpg" alt="Feeds loaded and ready to play" width="100%" /><br /><sub>Feeds loaded and ready to play</sub></td></tr>
+<tr><td align="center" width="50%"><img src="docs/screenshots/settings-theme-default.jpg" alt="Default theme" width="100%" /><br /><sub>Default theme</sub></td><td align="center" width="50%"><img src="docs/screenshots/settings-theme-dark.jpg" alt="Dark theme" width="100%" /><br /><sub>Dark theme</sub></td></tr>
+<tr><td align="center" width="50%"><img src="docs/screenshots/settings-theme-light.jpg" alt="Light theme" width="100%" /><br /><sub>Light theme</sub></td><td align="center" width="50%"><img src="docs/screenshots/settings-account.jpg" alt="Account settings" width="100%" /><br /><sub>Account settings</sub></td></tr>
+<tr><td align="center" width="50%"><img src="docs/screenshots/settings.jpg" alt="About and updates" width="100%" /><br /><sub>About and updates</sub></td></tr>
+</table>
+
+<div align="center">
+
 **A free, open-source CCTV viewer for Windows: watch live public feeds and your own cameras on one multi-camera wall.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
