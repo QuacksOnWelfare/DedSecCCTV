@@ -4,19 +4,55 @@
 
 # DedSec CCTV
 
-<img src="docs/screenshots/fullscreen.jpg" alt="DedSec CCTV full screen wall" width="100%" />
-<br /><sub>Full screen camera wall</sub>
-
 </div>
 
-<table>
-<tr><td align="center" width="50%"><img src="docs/screenshots/wall.jpg" alt="Camera wall with four feeds live" width="100%" /><br /><sub>Camera wall with four feeds live</sub></td><td align="center" width="50%"><img src="docs/screenshots/add-cctv.jpg" alt="Add CCTV: browse the catalog by country" width="100%" /><br /><sub>Add CCTV: browse the catalog by country</sub></td></tr>
-<tr><td align="center" width="50%"><img src="docs/screenshots/login.jpg" alt="Sign in" width="100%" /><br /><sub>Sign in</sub></td><td align="center" width="50%"><img src="docs/screenshots/setup-2fa.jpg" alt="Optional two-factor setup" width="100%" /><br /><sub>Optional two-factor setup</sub></td></tr>
-<tr><td align="center" width="50%"><img src="docs/screenshots/wall-empty.jpg" alt="Empty wall ready for feeds" width="100%" /><br /><sub>Empty wall ready for feeds</sub></td><td align="center" width="50%"><img src="docs/screenshots/wall-ready.jpg" alt="Feeds loaded and ready to play" width="100%" /><br /><sub>Feeds loaded and ready to play</sub></td></tr>
-<tr><td align="center" width="50%"><img src="docs/screenshots/settings-theme-default.jpg" alt="Default theme" width="100%" /><br /><sub>Default theme</sub></td><td align="center" width="50%"><img src="docs/screenshots/settings-theme-dark.jpg" alt="Dark theme" width="100%" /><br /><sub>Dark theme</sub></td></tr>
-<tr><td align="center" width="50%"><img src="docs/screenshots/settings-theme-light.jpg" alt="Light theme" width="100%" /><br /><sub>Light theme</sub></td><td align="center" width="50%"><img src="docs/screenshots/settings-account.jpg" alt="Account settings" width="100%" /><br /><sub>Account settings</sub></td></tr>
-<tr><td align="center" width="50%"><img src="docs/screenshots/settings.jpg" alt="About and updates" width="100%" /><br /><sub>About and updates</sub></td></tr>
-</table>
+Full screen camera wall
+
+<img src="docs/screenshots/fullscreen.jpg" width="100%">
+
+Sign in
+
+<img src="docs/screenshots/login.jpg" width="100%">
+
+Optional two-factor setup
+
+<img src="docs/screenshots/setup-2fa.jpg" width="100%">
+
+Empty wall ready for feeds
+
+<img src="docs/screenshots/wall-empty.jpg" width="100%">
+
+Feeds loaded and ready to play
+
+<img src="docs/screenshots/wall-ready.jpg" width="100%">
+
+Camera wall with four feeds live
+
+<img src="docs/screenshots/wall.jpg" width="100%">
+
+Add CCTV: browse the catalog by country
+
+<img src="docs/screenshots/add-cctv.jpg" width="100%">
+
+Settings: Default theme
+
+<img src="docs/screenshots/settings-theme-default.jpg" width="100%">
+
+Settings: Dark theme
+
+<img src="docs/screenshots/settings-theme-dark.jpg" width="100%">
+
+Settings: Light theme
+
+<img src="docs/screenshots/settings-theme-light.jpg" width="100%">
+
+Settings: Account
+
+<img src="docs/screenshots/settings-account.jpg" width="100%">
+
+Settings: About and updates
+
+<img src="docs/screenshots/settings.jpg" width="100%">
 
 <div align="center">
 
