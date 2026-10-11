@@ -1,0 +1,9 @@
+; Copy to config.ini (next to app.py, or next to DedSecCCTV.exe) and edit.
+; Environment variables win over this file: DEDSEC_API_URL, DEDSEC_UPDATE_URL, DEDSEC_BLOCKED_IPS.
+[server]
+; Your self-hosted auth backend (server/ in this repo). Must be https://.
+api_url = https://auth.example.com
+; Folder that serves latest.json + the update zip (see server/deploy/updates/README.md).
+update_url = https://auth.example.com/updates/
+; Optional comma-separated public IPs that may not use the app (e.g. VPN exits). Empty = none.
+blocked_ips =

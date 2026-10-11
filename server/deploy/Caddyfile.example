@@ -1,0 +1,32 @@
+# /etc/caddy/Caddyfile  -- replace auth.example.com with your domain.
+# Optional (only if your DNS record is proxied through Cloudflare): uncomment the
+# global block so Caddy trusts Cloudflare for the real client IP. Fetch the current ranges:
+#   curl -s https://www.cloudflare.com/ips-v4 ; curl -s https://www.cloudflare.com/ips-v6
+# and paste them space-separated after "static". Then set TRUST_PROXY_HEADERS=true in .env.
+#{
+#	servers {
+#		trusted_proxies static <CLOUDFLARE_IPV4_RANGES> <CLOUDFLARE_IPV6_RANGES>
+#		client_ip_headers CF-Connecting-IP X-Forwarded-For
+#	}
+#}
+
+auth.example.com {
+	encode zstd gzip
+
+	# App updates (static files), see deploy/updates/README.md
+	handle_path /updates/* {
+		root * /var/www/dedsec-cctv-updates
+		file_server {
+			hide .*
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	header -Server
+	log {
+		output file /var/log/caddy/auth.log
+	}
+}

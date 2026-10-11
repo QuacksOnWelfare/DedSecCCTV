@@ -1,0 +1,12 @@
+# DedSec CCTV desktop app. Install into a venv:
+#   python -m venv venv && venv\Scripts\pip install -r requirements.txt
+PyQt6>=6.5
+python-vlc>=3.0.18
+qrcode>=7.4
+requests>=2.31
+keyring>=25.0
+cryptography>=42.0
+# build tooling (only needed for python build.py)
+nuitka>=2.4
+ordered-set>=4.1
+zstandard>=0.22

@@ -1,0 +1,29 @@
+[
+  {
+    "example": true,
+    "id": "uruguay-example-rtsp",
+    "name": "Example RTSP camera",
+    "city": "Example City",
+    "rtsp": "rtsp://username:password@192.0.2.10:554/stream1",
+    "banner": "banners/example-rtsp.jpg",
+    "category": "residential"
+  },
+  {
+    "example": true,
+    "id": "uruguay-example-mjpeg",
+    "name": "Example MJPEG camera",
+    "city": "Example City",
+    "rtsp": "http://192.0.2.20:8080/video.mjpg",
+    "banner": "banners/example-mjpeg.jpg",
+    "category": "traffic"
+  },
+  {
+    "example": true,
+    "id": "uruguay-example-hls",
+    "name": "Example HLS stream",
+    "city": "Example City",
+    "rtsp": "https://example.com/live/stream.m3u8",
+    "banner": "",
+    "category": "traffic"
+  }
+]

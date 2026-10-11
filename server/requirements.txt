@@ -1,0 +1,12 @@
+# Runtime (tested versions pinned; bump deliberately)
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+SQLAlchemy==2.1.4
+pydantic==2.14.0
+pydantic-settings==2.15.0
+email-validator==2.3.0
+argon2-cffi==25.1.0
+PyJWT==2.15.1
+cryptography==50.0.2
+# Postgres (optional): DATABASE_URL=postgresql+psycopg://...
+# psycopg[binary]==3.2.*

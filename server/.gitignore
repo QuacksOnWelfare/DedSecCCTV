@@ -1,0 +1,15 @@
+.env
+*.db
+*.db-*
+*.sqlite*
+*.log
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.bak
+*.prev*
+*.pem
+*.key
+deploy/updates/*
+!deploy/updates/README.md

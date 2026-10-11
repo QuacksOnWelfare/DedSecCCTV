@@ -1,0 +1,32 @@
+# /etc/systemd/system/dedsec-cctv-server.service
+[Unit]
+Description=DedSec CCTV auth server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dedsec
+Group=dedsec
+WorkingDirectory=/opt/dedsec-cctv-server/server
+EnvironmentFile=/opt/dedsec-cctv-server/server/.env
+ExecStart=/opt/dedsec-cctv-server/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --no-server-header --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+# sandboxing
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/dedsec-cctv-server/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

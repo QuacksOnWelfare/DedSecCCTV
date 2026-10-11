@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+nuitka_build/
+DedSecCCTV/
+config.ini
+.env

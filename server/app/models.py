@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from .db import Base
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # brute-force protection
+    failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # 2FA (secret encrypted with Fernet)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    totp_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    totp_pending_secret_enc: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    totp_last_step: Mapped[int | None] = mapped_column(Integer, nullable=True)  # replay protection
+
+    # bump to invalidate every outstanding access token ("log out everywhere")
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
+
+    # hardware (device) lock: one account = one PC. Only hashes are stored, never the raw HWID.
+    # All nullable so the startup migration can ADD COLUMN them to an existing table.
+    device_hwid_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    device_reset_code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_reset_expires: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    device_reset_new_hwid_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_reset_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+
+    @property
+    def device_bound(self) -> bool:
+        return self.device_hwid_hash is not None
+
+    refresh_tokens: Mapped[list[RefreshToken]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class EmailVerificationToken(Base):
+    __tablename__ = "email_verification_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    family_id: Mapped[str] = mapped_column(String(36), index=True)  # one family per login session
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    replaced_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="refresh_tokens")
+
+
+class LoginChallenge(Base):
+    """Pending 2FA challenge issued after a correct password when TOTP is enabled."""
+    __tablename__ = "login_challenges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
