@@ -107,6 +107,32 @@ def build() -> None:
         shutil.copytree(tpl, OUT_DIR / "user_streams")
     # user_streams/ (the user's own catalog) is created by the app on first run next to the exe.
     print(f"OK  {OUT_DIR / EXE_NAME}")
+    build_installer()
+
+
+def build_installer() -> None:
+    """Build the Inno Setup installer (installer/build_installer.ps1). Skip with --no-installer."""
+    if "--no-installer" in sys.argv:
+        print("Skipping installer (--no-installer)")
+        return
+    script = APP_DIR / "installer" / "build_installer.ps1"
+    if not script.is_file():
+        print("installer/build_installer.ps1 not found - skipping installer")
+        return
+    if os.name != "nt":
+        print("Not on Windows - skipping installer")
+        return
+    print("Building installer...")
+    rc = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                         "-DistDir", str(OUT_DIR)], cwd=APP_DIR).returncode
+    if rc != 0:
+        print("WARNING: installer build failed (the app build above is still fine). "
+              "Is Inno Setup installed? winget install JRSoftware.InnoSetup")
+        return
+    out = sorted((APP_DIR / "installer" / "Output").glob("DedSecCCTV-Setup-*.exe"),
+                 key=lambda p: p.stat().st_mtime)
+    if out:
+        print(f"OK  {out[-1]}")
 
 
 if __name__ == "__main__":

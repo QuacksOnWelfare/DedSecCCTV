@@ -6,9 +6,9 @@ Thanks for taking the time to look at the security of DedSec CCTV. This page exp
 
 | Version | Supported |
 | --- | --- |
-| Latest official release (1.0.1 and newer) | Yes |
+| Latest official release (1.0.2 and newer) | Yes |
 | `main` branch | Yes |
-| Anything older than 1.0.1 | No |
+| Anything older than 1.0.2 | No |
 
 If you are on an older build, update first and check whether the issue is still there.
 

@@ -14,7 +14,7 @@ itself be replaced by an update.
 Safety:
 * never elevates (runs as the same user as the app);
 * refuses zip entries with absolute paths, drive letters or ``..`` and never writes outside --target;
-* never deletes anything: files not in the zip stay; existing files under ``user_streams/`` (the
+* never deletes anything: files not in the zip stay; existing files under ``streams/`` (the
   user's camera lists) are kept as they are, only new files are added there;
 * every replaced file is backed up first and restored if anything fails, then the old app is
   started again;
@@ -35,7 +35,7 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
-PRESERVE_DIRS = ("user_streams", "streams",)          # existing files here are never overwritten
+PRESERVE_DIRS = ("streams",)          # existing files here are never overwritten
 APP_MARKERS = ("DedSecCCTV.exe", "app.py")
 LOG_PATH = Path(tempfile.gettempdir()) / "DedSecUpdater.log"
 
@@ -233,6 +233,10 @@ def apply_update(zip_path: Path, target: Path) -> dict:
 
 def launch_app(launch: Path, target: Path, python: str | None) -> None:
     launch = launch.resolve()
+    if not launch.is_file():  # old builds passed python.exe; fall back to the app exe
+        alt = target.resolve() / "DedSecCCTV.exe"
+        if alt.is_file():
+            launch = alt
     if target.resolve() not in launch.parents:
         raise UpdateFailed(f"refusing to start {launch}: not inside {target}")
     if not launch.is_file():

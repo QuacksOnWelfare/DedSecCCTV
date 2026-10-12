@@ -76,6 +76,11 @@ def init_db() -> None:
     from . import models  # noqa: F401  (register tables)
     Base.metadata.create_all(bind=engine)
     add_missing_columns(engine)
+    with engine.begin() as conn:
+        conn.execute(text('CREATE INDEX IF NOT EXISTS ix_users_email_unsub_token_hash ON users (email_unsub_token_hash)'))
+        conn.execute(text('UPDATE users SET email_updates = 0 WHERE email_updates IS NULL'))
+    from .email_prefs import ensure_all_tokens
+    ensure_all_tokens()
 
 
 def get_db() -> Iterator[Session]:

@@ -1,4 +1,4 @@
-"""DedSec CCTV auth client — drop-in module for the PyQt6 desktop app.
+"""DedSec CCTV auth client -- drop-in module for the PyQt6 desktop app.
 
 Talks to the DedSec auth backend over HTTPS, keeps the short-lived access token in
 memory only, and stores the long-lived (rotating) refresh token in the OS keyring
@@ -34,7 +34,7 @@ Today app.py shows a ``LockScreen`` that checks a TOTP code against the secret i
     class LoginDialog(QDialog):
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("DedSec CCTV — Sign in")
+            self.setWindowTitle("DedSec CCTV -- Sign in")
             self.email = QLineEdit(); self.pw = QLineEdit()
             self.pw.setEchoMode(QLineEdit.EchoMode.Password)
             self.err = QLabel(); btn = QPushButton("Sign in")
@@ -89,12 +89,19 @@ from urllib.parse import urlparse
 
 import requests
 
-__all__ = ["AuthClient", "AuthError", "TotpRequired", "DeviceLocked", "hardware_id", "TokenStore", "User", "SavedLogin", "SavedCredentials",
+__all__ = ["AuthClient", "AuthError", "TotpRequired", "DeviceLocked", "UpdateRequiredError", "hardware_id", "TokenStore", "User", "SavedLogin", "SavedCredentials",
            "hardware_id", "DEVICE_LOCKED_STATUS"]
 
 APP_DIR_NAME = "DedSecCctv"
 KEYRING_SERVICE = "DedSecCCTV-auth"
 LOGIN_KEYRING_SERVICE = "DedSecCCTV-login"  # "Remember me" credentials (OS store only)
+
+# Sent on every request so the server can refuse versions older than its MIN_APP_VERSION.
+APP_VERSION_HEADER = "X-DedSec-App-Version"
+APP_VERSION = "1.0.2"  # default only; app.py passes its own APP_VERSION to AuthClient(app_version=...)
+UPDATE_REQUIRED_STATUS = 426
+UPDATE_REQUIRED_MSG = "This version of DedSec CCTV is out of date. Please update to keep using the app."
+_VERSION_HEADER_RE = re.compile(r"^[0-9A-Za-z.+-]{1,32}$")
 
 
 class AuthError(Exception):
@@ -103,6 +110,17 @@ class AuthError(Exception):
     def __init__(self, message: str, status: int = 0) -> None:
         super().__init__(message)
         self.status = status
+
+
+class UpdateRequiredError(AuthError):
+    """The server refuses this app version (HTTP 426 ``update_required``); the user must update.
+
+    ``min_version`` is the oldest version the server still accepts ("" if it didn't say).
+    """
+
+    def __init__(self, message: str = "", status: int = 426, min_version: str = "") -> None:
+        super().__init__(message or UPDATE_REQUIRED_MSG, status)
+        self.min_version = min_version
 
 
 class TotpRequired(AuthError):
@@ -540,6 +558,7 @@ class AuthClient:
         allow_insecure_localhost: bool = False,
         token_store: TokenStore | None = None,
         device_id: Any = None,
+        app_version: str | None = None,
     ) -> None:
         u = urlparse(base_url)
         local = u.hostname in {"localhost", "127.0.0.1", "::1"}
@@ -550,6 +569,11 @@ class AuthClient:
         self._s = requests.Session()
         self._s.verify = verify
         self._s.headers.update({"User-Agent": "DedSecCCTV-Desktop/1.0", "Accept": "application/json"})
+        version = str(app_version or APP_VERSION).strip()
+        if not _VERSION_HEADER_RE.match(version):  # never put junk/CRLF into a header
+            raise ValueError(f"invalid app_version {version!r}")
+        self.app_version = version
+        self._s.headers[APP_VERSION_HEADER] = version
         self._s.trust_env = False  # ignore proxy env vars that could intercept credentials
         self._store = token_store or TokenStore(account=f"{profile}@{u.hostname}")
         self._lock = threading.RLock()
@@ -605,8 +629,12 @@ class AuthClient:
             return
         try:
             detail = r.json().get("detail", r.reason)
-        except ValueError:
+        except (ValueError, AttributeError):  # not JSON, or JSON that isn't an object
             detail = r.reason
+        if r.status_code == UPDATE_REQUIRED_STATUS or r.headers.get("X-Error-Code") == "update_required" or (
+                isinstance(detail, dict) and detail.get("code") == "update_required"):
+            min_v = str(detail.get("min_version") or "")[:32] if isinstance(detail, dict) else ""
+            raise UpdateRequiredError(UPDATE_REQUIRED_MSG, r.status_code, min_v)
         if isinstance(detail, dict) and "password" in detail:
             detail = "Password " + "; ".join(detail["password"])
         elif isinstance(detail, list):
@@ -649,14 +677,34 @@ class AuthClient:
     def is_authenticated(self) -> bool:
         return self._refresh is not None
 
-    def register(self, email: str, password: str) -> str:
-        """Create an account. The server always answers generically; check your inbox."""
-        r = self._post("/auth/register", {"email": email, "password": password})
+    def register(self, email: str, password: str, email_updates: bool = False, terms_accepted: bool = False) -> str:
+        """Create an account. The server always answers generically; check your inbox.
+
+        ``email_updates`` is the sign-up opt-in for product-update emails (default off, UK PECR/GDPR)."""
+        r = self._post("/auth/register", {"email": email, "password": password, "email_updates": bool(email_updates),
+                                            "terms_accepted": bool(terms_accepted)})
         self._raise_for(r)
         return str(r.json()["message"])
 
-    def verify_email(self, token: str) -> None:
-        self._raise_for(self._post("/auth/verify-email", {"token": token.strip()}))
+    def get_email_updates(self) -> bool:
+        """Is this account opted in to product-update emails?"""
+        r = self._request("GET", "/account/email-preferences", None, auth=True)
+        self._raise_for(r)
+        return bool(r.json().get("email_updates"))
+
+    def set_email_updates(self, enabled: bool) -> bool:
+        """Opt in/out of product-update emails. Returns the stored value."""
+        r = self._request("PUT", "/account/email-preferences", {"email_updates": bool(enabled)}, auth=True)
+        self._raise_for(r)
+        return bool(r.json().get("email_updates"))
+
+    def verify_email(self, token: str, email: str | None = None) -> None:
+        """Verify with the 6-digit emailed code. Sending the email enables the per-account attempt limit."""
+        code = "".join(ch for ch in token if ch.isdigit()) if len(token.strip()) <= 12 else token.strip()
+        body: dict[str, Any] = {"token": code}
+        if email:
+            body["email"] = email.strip()
+        self._raise_for(self._post("/auth/verify-email", body))
 
     def login(self, email: str, password: str) -> User | None:
         """Log in. Returns the user, or raises ``TotpRequired`` if a 2FA code is needed."""
@@ -694,6 +742,8 @@ class AuthClient:
             try:
                 self._do_refresh()
                 return True
+            except UpdateRequiredError:
+                raise  # keep the stored session: it works again once the app is updated
             except AuthError as e:
                 if e.status in (401, DEVICE_LOCKED_STATUS):
                     self._clear_session()
@@ -726,7 +776,7 @@ class AuthClient:
         return str(r.json().get("message", ""))
 
     def setup_2fa(self, existing_secret: str | None = None) -> dict[str, Any]:
-        """Start 2FA enrolment. Returns ``{"secret", "otpauth_uri", ...}`` — render the URI as a QR."""
+        """Start 2FA enrolment. Returns ``{"secret", "otpauth_uri", ...}`` -- render the URI as a QR."""
         body = {"existing_secret": existing_secret} if existing_secret else {}
         r = self._post("/auth/2fa/setup", body, auth=True)
         self._raise_for(r)

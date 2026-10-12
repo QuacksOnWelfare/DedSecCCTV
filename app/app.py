@@ -23,6 +23,7 @@ from PyQt6.QtCore import (Qt, QTimer, QObject, pyqtSignal, QEventLoop, QRectF, Q
                           QPropertyAnimation, QEasingCurve, pyqtProperty)
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QPixmap, QPainter, QColor, QIcon, QPalette, QImage, QLinearGradient, QPen, QPainterPath,
+    QKeySequence, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -31,7 +32,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QFileDialog,
 )
 
-from dedsec_auth_client import AuthClient, AuthError, DeviceLocked, SavedLogin, TotpRequired
+from dedsec_auth_client import AuthClient, AuthError, DeviceLocked, SavedLogin, TotpRequired, UpdateRequiredError
 
 # ---------------------------------------------------------------------------
 # Themes
@@ -311,7 +312,7 @@ def save_setting(key: str, value) -> None:
 # ---------------------------------------------------------------------------
 # App version (semver). Bump it for every release you publish; see docs/APP_SETUP.md and server/deploy/updates/README.md.
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 # Auto-update: static files served by Caddy on the same VPS (never the API). Only HTTPS, and only
 # files under this folder are ever downloaded; the zip's SHA-256 must match latest.json.
 def _load_app_config() -> dict:
@@ -359,6 +360,7 @@ DEFAULT_UPDATE_URL = "https://auth.example.com/updates/"
 UPDATE_BASE_URL = _config_value("DEDSEC_UPDATE_URL", "update_url", DEFAULT_UPDATE_URL)
 if not UPDATE_BASE_URL.endswith("/"):
     UPDATE_BASE_URL += "/"
+GITHUB_RELEASES_URL = "https://github.com/QuacksOnWelfare/DedSecCCTV/releases"
 UPDATE_CHECK_TIMEOUT = 8.0
 UPDATE_MAX_BYTES = 1024 * 1024 * 1024  # refuse anything bigger than 1 GiB
 UPDATER_EXE_NAME = "DedSecUpdater.exe"
@@ -405,6 +407,57 @@ def _read_public_ip() -> str:
 def _vpn_blocked() -> bool:
     return _PUBLIC_IP in BLOCKED_VPN_IPS
 
+
+# ---------------------------------------------------------------------------
+# VPN awareness: GET /net/check on our server says whether this connection looks like a VPN /
+# datacenter or a home ISP. The server never echoes the IP back. Advisory only, never blocking.
+# ---------------------------------------------------------------------------
+VPN_DOWNLOAD_URL = "https://windscribe.com/download"
+NET_CHECK_TIMEOUT = 5.0
+_NET_STATUS: dict = {"vpn": None}  # last result, shared by the banner and Settings
+
+
+def check_connection() -> dict:
+    """Blocking; call from a background thread. Returns {'vpn': True|False|None, ...}."""
+    url = API_BASE_URL.rstrip("/") + "/net/check"
+    if not url.startswith("https://") and not DEDSEC_DEV:
+        return {"vpn": None}
+    try:
+        req = Request(url, headers={"User-Agent": f"DedSecCCTV/{APP_VERSION}", "Accept": "application/json"})
+        with urlopen(req, timeout=NET_CHECK_TIMEOUT) as resp:
+            data = json.loads(resp.read(4096).decode("utf-8", "replace"))
+        vpn = data.get("vpn") if isinstance(data, dict) else None
+        res = {"vpn": vpn if isinstance(vpn, bool) else None,
+               "isp_type": str(data.get("isp_type") or "unknown"), "country": data.get("country")}
+    except Exception:
+        res = {"vpn": None}
+    _NET_STATUS.clear()
+    _NET_STATUS.update(res)
+    return res
+
+
+def connection_label(vpn) -> str:
+    return "VPN detected" if vpn is True else ("No VPN detected" if vpn is False else "Unknown")
+
+
+def open_url(url: str) -> None:
+    from PyQt6.QtCore import QUrl
+    from PyQt6.QtGui import QDesktopServices
+    QDesktopServices.openUrl(QUrl(url))
+
+
+# Terms of use (same wording as installer TERMS.txt and the repo's TERMS.md).
+TERMS_TEXT = "DedSec CCTV - Terms of use\n\nDedSec CCTV shows publicly available camera streams from third-party providers.\n\nBy using the app you agree to use it responsibly, in line with the terms of the stream providers, and you are responsible for how you use it.\n\nDedSec Lab doesn't control these streams and isn't responsible for their content or availability, or for how the app is used.\n\nYou're responsible for your own connection and its security. We recommend using a VPN while viewing streams.\n\nThe software is provided as is, without warranty (see the MIT licence).\n\nThanks for using DedSec CCTV."
+
+
+def show_terms(parent=None) -> None:
+    box = QMessageBox(parent)
+    box.setWindowTitle("Terms of use")
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setText(TERMS_TEXT.replace("\n\n", "\n\n"))
+    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+    box.exec()
+
 ALL_COUNTRIES = (
     "Afghanistan","Albania","Algeria","Andorra","Angola","Antigua and Barbuda","Argentina","Armenia","Australia","Austria",
     "Azerbaijan","Bahamas","Bahrain","Bangladesh","Barbados","Belarus","Belgium","Belize","Benin","Bhutan",
@@ -430,10 +483,16 @@ ALL_COUNTRIES = (
 
 
 # ---------------------------------------------------------------------------
-# Stream catalog: "My streams" only.
-#   user_streams/<Country>/streams.json next to the exe (writable, the user's own).
+# Stream catalogs
+#   "owner": DedSec catalog. Release builds read the encrypted assets/catalog.dat (packed by
+#            pack_streams.py at build time, decrypted into memory only). Dev runs fall back
+#            to the plain streams/<Country>/ folder next to app.py.
+#   "user":  user_streams/<Country>/streams.json next to the exe (writable, the user's own).
 # ---------------------------------------------------------------------------
+SOURCE_OWNER = "owner"
 SOURCE_USER = "user"
+_OWNER_CATALOG = None          # {"countries": {...}, "banners": {...}} once catalog.dat is loaded
+_OWNER_CATALOG_TRIED = False
 _ROWS_CACHE: dict = {}
 
 
@@ -441,6 +500,41 @@ def _exe_dir() -> Path:
     if getattr(sys, "frozen", False) or "__compiled__" in globals():
         return Path(sys.argv[0]).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def open_install_folder(parent=None) -> bool:
+    """Open install_dir() (exe folder for builds, e.g. %LOCALAPPDATA%\\Programs\\DedSec CCTV; app source
+    folder when run from source) in Explorer (Finder / file manager elsewhere). Fixed path, no user input."""
+    path = install_dir()
+    if not path.is_dir():
+        QMessageBox.warning(parent, "Install folder", "The install folder could not be found.")
+        return False
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # noqa: S606 - opens a folder, not a document from user input
+            return True
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            return True
+    except Exception:
+        pass
+    QMessageBox.warning(parent, "Install folder", f"Could not open the install folder:\n{path}")
+    return False
+
+
+def _streams_root() -> Path:
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent / "streams")
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            roots.append(Path(meipass) / "streams")
+    roots.append(Path(__file__).resolve().parent / "streams")
+    for path in roots:
+        if path.is_dir():
+            return path
+    return roots[-1]
 
 
 _USER_ROOT = None
@@ -460,8 +554,36 @@ def user_streams_root() -> Path:
     return _USER_ROOT
 
 
-def _source_root(source: str = SOURCE_USER) -> Path:
-    return user_streams_root()
+def _catalog_file() -> Path | None:
+    override = os.environ.get("DEDSEC_CATALOG", "").strip()
+    if override.lower() == "off":  # dev: force the plain streams/ folder
+        return None
+    cands = [Path(override)] if override else []
+    cands += [Path(__file__).resolve().parent / "assets" / "catalog.dat", _exe_dir() / "assets" / "catalog.dat"]
+    for path in cands:
+        if path.is_file():
+            return path
+    return None
+
+
+def owner_catalog():
+    """Decrypted catalog.dat (cached), or None when running from a plain streams/ folder."""
+    global _OWNER_CATALOG, _OWNER_CATALOG_TRIED
+    if not _OWNER_CATALOG_TRIED:
+        _OWNER_CATALOG_TRIED = True
+        path = _catalog_file()
+        if path is not None:
+            try:
+                from catalog_crypto import decrypt_catalog
+                _OWNER_CATALOG = decrypt_catalog(path.read_bytes())
+            except Exception as exc:
+                print(f"catalog.dat could not be loaded: {exc}", file=sys.stderr)
+                _OWNER_CATALOG = None
+    return _OWNER_CATALOG
+
+
+def _source_root(source: str) -> Path:
+    return user_streams_root() if source == SOURCE_USER else _streams_root()
 
 
 def _read_folder_rows(folder: Path):
@@ -483,11 +605,17 @@ def _read_folder_rows(folder: Path):
     return rows
 
 
-def _load_country_streams(country: str, source: str = SOURCE_USER):
+def _load_country_streams(country: str, source: str = SOURCE_OWNER):
+    if source != SOURCE_USER:
+        cat = owner_catalog()
+        if cat is not None:
+            return [dict(r) for r in cat["countries"].get(country, []) if isinstance(r, dict)]
     return _read_folder_rows(_source_root(source) / country)
 
 
-def _source_folder_names(source: str = SOURCE_USER):
+def _source_folder_names(source: str):
+    if source != SOURCE_USER and owner_catalog() is not None:
+        return list(owner_catalog()["countries"].keys())
     root = _source_root(source)
     try:
         return [p.name for p in root.iterdir() if p.is_dir()] if root.is_dir() else []
@@ -495,11 +623,13 @@ def _source_folder_names(source: str = SOURCE_USER):
         return []
 
 
-def catalog_available(source: str = SOURCE_USER) -> bool:
+def catalog_available(source: str = SOURCE_OWNER) -> bool:
+    if source != SOURCE_USER and owner_catalog() is not None:
+        return True
     return _source_root(source).is_dir()
 
 
-def catalog_countries(query: str = "", source: str = SOURCE_USER):
+def catalog_countries(query: str = "", source: str = SOURCE_OWNER):
     needle = (query or "").strip().lower()
     names = list(ALL_COUNTRIES)
     for name in _source_folder_names(source):
@@ -510,7 +640,7 @@ def catalog_countries(query: str = "", source: str = SOURCE_USER):
     return [name for name in names if needle in name.lower()]
 
 
-def catalog_streams(country: str, source: str = SOURCE_USER):
+def catalog_streams(country: str, source: str = SOURCE_OWNER):
     out = []
     for row in _load_country_streams(country, source):
         if not isinstance(row, dict) or not _valid_rtsp(row.get("rtsp", "")):
@@ -518,12 +648,13 @@ def catalog_streams(country: str, source: str = SOURCE_USER):
         if not row.get("category"):
             rtsp = str(row.get("rtsp") or "").strip().lower()
             row["category"] = "traffic" if rtsp.startswith(("http://", "https://")) else "residential"
-        row["_source"] = SOURCE_USER
+        if source == SOURCE_USER:
+            row["_source"] = SOURCE_USER
         out.append(row)
     return out
 
 
-def stream_counts(source: str = SOURCE_USER):
+def stream_counts(source: str = SOURCE_OWNER):
     counts = {}
     total = 0
     names = list(ALL_COUNTRIES)
@@ -622,7 +753,7 @@ def ensure_user_streams(root: Path | None = None) -> Path:
 #   streams/<Country>/banners/<value>
 #   streams/<value>                      (path relative to the streams root)
 # Absolute paths are honoured too. Only png/jpg/jpeg/webp/bmp/gif files are used.
-# See user_streams/README.txt for the JSON shape.
+# See STREAMS.md for the JSON shape.
 # ---------------------------------------------------------------------------
 BANNER_KEYS = ("banner", "thumb", "thumbnail", "image", "preview")
 BANNER_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -644,14 +775,38 @@ def _usable_image(path: Path) -> bool:
         return False
 
 
-def _stream_banner_path(country: str, row, source: str = SOURCE_USER):
+class _MemBanner:
+    """A banner held in memory (from the encrypted catalog); never written to disk."""
+    parent = None
+    suffix = ".img"
+
+    def __init__(self, key: str, data: bytes):
+        self.key = key
+        self.data = data
+
+    def __str__(self) -> str:
+        return f"mem:{self.key}"
+
+
+def _stream_banner_path(country: str, row, source: str = SOURCE_OWNER):
     if not isinstance(row, dict):
         return None
+    if row.get("_source") == SOURCE_USER:
+        source = SOURCE_USER
+    cat = owner_catalog() if source != SOURCE_USER else None
     root = _source_root(source)
     folder = root / (country or "")
     for key in BANNER_KEYS:
         value = row.get(key)
         if not isinstance(value, str) or not value.strip():
+            continue
+        if cat is not None:
+            rel = value.strip().replace("\\", "/").lstrip("/")
+            for cand in (f"{country}/{rel}", f"{country}/banners/{rel}", rel):
+                cand = os.path.normpath(cand).replace("\\", "/")
+                data = cat["banners"].get(cand)
+                if data:
+                    return _MemBanner(cand, data)
             continue
         rel = Path(value.strip().replace("\\", "/"))
         candidates = [rel] if rel.is_absolute() else [folder / rel, folder / "banners" / rel, root / rel]
@@ -691,12 +846,15 @@ def _camera_banner_path(cam) -> Path | None:
                 return path
     # Catalog stream: look the banner up again from the catalog it came from
     country = str(cam.get("country") or "")
+    cam_id = str(cam.get("stream_id") or cam_id)  # catalog row id (wall id is a _wall_key)
     if country and cam_id:
-        row = next((r for r in catalog_streams(country, SOURCE_USER) if r.get("id") == cam_id), None)
-        if row is not None:
-            found = _stream_banner_path(country, row, SOURCE_USER)
-            if found is not None:
-                return found
+        first = SOURCE_USER if cam.get("catalog") == SOURCE_USER else SOURCE_OWNER
+        for source in (first, SOURCE_USER if first == SOURCE_OWNER else SOURCE_OWNER):
+            row = next((r for r in catalog_streams(country, source) if r.get("id") == cam_id), None)
+            if row is not None:
+                found = _stream_banner_path(country, row, source)
+                if found is not None:
+                    return found
     return None
 
 
@@ -743,7 +901,9 @@ def _placeholder_pixmap(w: int, h: int, text: str = "No preview") -> QPixmap:
 def _banner_pixmap(path: Path | None, w: int, h: int, placeholder: str = "No preview") -> QPixmap:
     """Cover-cropped w×h pixmap of ``path`` (LRU-cached), or a dark placeholder."""
     key = None
-    if path is not None:
+    if isinstance(path, _MemBanner):
+        key = (str(path), _THEME_STATE["name"], w, h)
+    elif path is not None:
         try:
             key = (str(path), path.stat().st_mtime_ns, w, h)
         except OSError:
@@ -756,7 +916,7 @@ def _banner_pixmap(path: Path | None, w: int, h: int, placeholder: str = "No pre
         return hit
     pix = None
     if path is not None and key[0] != "<placeholder>":
-        img = QImage(str(path))
+        img = QImage.fromData(path.data) if isinstance(path, _MemBanner) else QImage(str(path))
         if not img.isNull():
             scaled = img.scaled(w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                                 Qt.TransformationMode.SmoothTransformation)
@@ -772,7 +932,7 @@ def _banner_pixmap(path: Path | None, w: int, h: int, placeholder: str = "No pre
 
 
 def _stream_banner_pixmap(country: str, row, w: int = BANNER_W, h: int = BANNER_H,
-                          source: str = SOURCE_USER) -> QPixmap:
+                          source: str = SOURCE_OWNER) -> QPixmap:
     return _banner_pixmap(_stream_banner_path(country, row, source), w, h)
 
 
@@ -805,9 +965,10 @@ def _mask_rtsp(url: str) -> str:
         host = parsed.hostname or ""
         port = f":{parsed.port}" if parsed.port else ""
         path = parsed.path or ""
-        return f"rtsp://{host}{port}{path}" if host else "rtsp address saved"
+        scheme = (parsed.scheme or "rtsp").lower()
+        return f"{scheme}://{host}{port}{path}" if host else "address saved"
     except Exception:
-        return "rtsp address saved"
+        return "address saved"
 
 
 def _valid_rtsp(url: str) -> bool:
@@ -816,6 +977,52 @@ def _valid_rtsp(url: str) -> bool:
         return False
     parsed = urlparse(raw)
     return bool(parsed.hostname)
+
+
+CUSTOM_FEED_SCHEMES = ("rtsp", "rtsps", "http", "https")
+
+
+def _valid_custom_url(url: str) -> bool:
+    """Address typed in for one of the user's own feeds: rtsp(s):// or http(s):// with a host.
+    Anything else is refused: file paths (C:\\..., /home/..., \\\\share), file://, javascript:,
+    other schemes, embedded whitespace / control characters and malformed ports."""
+    raw = (url or "").strip()
+    if not raw or len(raw) > 2048:
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return False
+    try:
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        port = parsed.port  # ValueError on a non-numeric / out-of-range port
+    except ValueError:
+        return False
+    if port == 0:
+        return False
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in CUSTOM_FEED_SCHEMES or not raw.lower().startswith(scheme + "://"):
+        return False
+    return bool(host)
+
+
+def _wall_key(source: str, country: str, stream_id) -> str:
+    """Globally unique id for a catalog stream on the wall. Stream ids are only unique inside one
+    country folder (e.g. "Hipcam-RealServer1" exists in ~25 countries), so the wall keys on
+    source + country + stream id. Filename-safe (also names the AppData banner copy)."""
+    raw = f"{source or SOURCE_OWNER}\n{country or ''}\n{stream_id or ''}"
+    return "cat-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _stream_matches(row, country: str, needle: str) -> bool:
+    """Stream search: case-insensitive substring on id, name, city, country and IP / host."""
+    needle = (needle or "").strip().lower()
+    if not needle:
+        return True
+    if not isinstance(row, dict):
+        return False
+    fields = (row.get("id"), row.get("name"), row.get("city"), row.get("country"), country,
+              row.get("ip"), row.get("host"), _host_of(str(row.get("rtsp") or "")))
+    return any(needle in str(value).lower() for value in fields if value)
 
 
 CLIP_RELOAD_MS = 180_000
@@ -916,12 +1123,23 @@ def _web_headers(media, url: str) -> None:
 class _PoolBridge(QObject):
     """Delivers worker-thread results (IPCamLive lookups) to the UI thread and owns the pool's timers."""
     resolved = pyqtSignal(str, int, str)
+    vlc_event = pyqtSignal(str, int, str)  # key, play token, "error" | "playing" (from VLC threads)
 
 
 # Players whose stop() did not return before shutdown gave up waiting. They are never
 # released (releasing a player that is still stopping is a use-after-free inside libvlc)
 # and main() exits with os._exit so interpreter teardown can't race the VLC threads.
 _ABANDONED_PLAYERS: list = []
+
+CONNECT_TIMEOUT_MS = 15_000   # a feed that has not reached Playing by then counts as failed
+_WATCH_MS = 1_000             # state poll interval while a feed is connecting
+
+
+def _vlc_state_name(player) -> str:
+    try:
+        return str(player.get_state()).rsplit(".", 1)[-1].lower()
+    except Exception:
+        return ""
 
 
 def _vlc_busy() -> bool:
@@ -947,9 +1165,13 @@ class VlcPool:
         self._tokens = {}
         self._token_seq = 0
         self._widgets = {}
+        self._watch_timers = {}
+        self._fail_handlers = {}   # key -> callable(), fired at most once per play() on the UI thread
+        self._started = {}         # key -> monotonic start of the current play()
         self._alive = True
         self._bridge = _PoolBridge()
         self._bridge.resolved.connect(self._on_resolved)
+        self._bridge.vlc_event.connect(self._on_vlc_event)
         self._instance, self.detail = shared_vlc()
         self.ready = self._instance is not None
 
@@ -993,7 +1215,10 @@ class VlcPool:
         timer.start()
 
     # -- play -----------------------------------------------------------------
-    def play(self, key: str, rtsp: str, widget: QWidget) -> bool:
+    def play(self, key: str, rtsp: str, widget: QWidget, on_fail=None) -> bool:
+        """Start ``rtsp`` on ``key``. ``on_fail`` (optional) is called once, on the UI thread, when
+        VLC reports an error / the media state goes to Error / it never reaches Playing within
+        CONNECT_TIMEOUT_MS. It is dropped when the key is stopped."""
         if not self._alive or not self._instance or not rtsp or widget is None:
             return False
         try:
@@ -1007,6 +1232,14 @@ class VlcPool:
             token = self._token_seq
             self._tokens[key] = token
             self._widgets[key] = widget
+            self._stop_timer(self._watch_timers, key)
+            if on_fail is not None:
+                self._fail_handlers[key] = on_fail
+                self._started[key] = time.monotonic()
+                self._timer(self._watch_timers, key, _WATCH_MS,
+                            lambda k=key, t=token: self._watch(k, t), False)
+            else:
+                self._fail_handlers.pop(key, None)
             resolved = _ipcamlive_cached(rtsp)
             if resolved is None:
                 # IPCamLive needs an HTTP lookup: do it off the UI thread, attach when it returns.
@@ -1039,6 +1272,8 @@ class VlcPool:
             media = self._clip_media(rtsp, True) if clip else self._instance.media_new(url)
             _web_headers(media, rtsp)
             player.set_media(media)
+            if key in self._fail_handlers:
+                self._hook_events(key, player, self._tokens.get(key, 0))
             if clip:
                 self._timer(self._clip_timers, key, CLIP_RELOAD_MS,
                             lambda k=key, u=rtsp, pl=player: self._reload_clip(k, u, pl), False)
@@ -1055,6 +1290,77 @@ class VlcPool:
         except Exception:
             return False
 
+    # -- failure detection --------------------------------------------------------
+    def _hook_events(self, key: str, player, token: int) -> None:
+        """VLC fires these on its own threads: only emit a queued Qt signal from them."""
+        try:
+            import vlc
+            em = player.event_manager()
+            bridge = self._bridge
+
+            def emit(kind, k=key, t=token):
+                try:
+                    bridge.vlc_event.emit(k, t, kind)
+                except RuntimeError:  # bridge gone (shutdown)
+                    pass
+            for etype in (vlc.EventType.MediaPlayerEncounteredError, vlc.EventType.MediaPlayerPlaying):
+                try:
+                    em.event_detach(etype)
+                except Exception:
+                    pass
+            em.event_attach(vlc.EventType.MediaPlayerEncounteredError, lambda _e: emit("error"))
+            em.event_attach(vlc.EventType.MediaPlayerPlaying, lambda _e: emit("playing"))
+        except Exception:
+            pass  # state polling in _watch still catches failures
+
+    @staticmethod
+    def _unhook_events(player) -> None:
+        try:
+            import vlc
+            em = player.event_manager()
+            for etype in (vlc.EventType.MediaPlayerEncounteredError, vlc.EventType.MediaPlayerPlaying):
+                try:
+                    em.event_detach(etype)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_vlc_event(self, key: str, token: int, kind: str) -> None:
+        if not self._alive or self._tokens.get(key) != token or key not in self._fail_handlers:
+            return  # stale event from a player that was stopped / replaced
+        if kind == "playing":
+            self._started.pop(key, None)  # connected: stop watching for the timeout
+            self._stop_timer(self._watch_timers, key)
+        elif kind == "error":
+            self._fail(key, token)
+
+    def _watch(self, key: str, token: int) -> None:
+        if not self._alive or self._tokens.get(key) != token:
+            self._stop_timer(self._watch_timers, key)
+            return
+        player = self._players.get(key)
+        state = _vlc_state_name(player) if player is not None else ""
+        if state == "playing":
+            self._started.pop(key, None)
+            self._stop_timer(self._watch_timers, key)
+            return
+        begun = self._started.get(key)
+        if state == "error" or (begun is not None and (time.monotonic() - begun) * 1000 >= CONNECT_TIMEOUT_MS):
+            self._fail(key, token)
+
+    def _fail(self, key: str, token: int) -> None:
+        if self._tokens.get(key) != token:
+            return
+        handler = self._fail_handlers.pop(key, None)
+        self._started.pop(key, None)
+        self._stop_timer(self._watch_timers, key)
+        if handler is not None:
+            try:
+                handler()
+            except Exception:
+                pass
+
     def _kick_audio(self, key: str, player) -> None:
         self._kick_timers.pop(key, None)
         if not self._alive or self._players.get(key) is not player:
@@ -1070,9 +1376,15 @@ class VlcPool:
     def _detach(self, key: str):
         self._stop_timer(self._clip_timers, key)
         self._stop_timer(self._kick_timers, key)
+        self._stop_timer(self._watch_timers, key)
+        self._fail_handlers.pop(key, None)
+        self._started.pop(key, None)
         self._tokens.pop(key, None)
         self._widgets.pop(key, None)
-        return self._players.pop(key, None)
+        player = self._players.pop(key, None)
+        if player is not None:
+            self._unhook_events(player)
+        return player
 
     @staticmethod
     def _reap(players: list) -> list:
@@ -1135,11 +1447,16 @@ class VlcPool:
     def shutdown(self, wait: float = 3.0) -> bool:
         """Final teardown: no callback may touch a player after this. Idempotent."""
         self._alive = False
-        for table in (self._clip_timers, self._kick_timers):
+        self._fail_handlers.clear()
+        for table in (self._clip_timers, self._kick_timers, self._watch_timers):
             for key in list(table):
                 self._stop_timer(table, key)
         try:
             self._bridge.resolved.disconnect()
+        except Exception:
+            pass
+        try:
+            self._bridge.vlc_event.disconnect()
         except Exception:
             pass
         ok = self.stop_all(wait)
@@ -1163,7 +1480,7 @@ def lookup_isp(url: str) -> dict:
     try:
         raw = urlopen(Request(
             f"http://ip-api.com/json/{host}?fields=status,query,country,countryCode,regionName,city,isp,org,as",
-            headers={"User-Agent": "DedSecCCTV"},
+            headers={"User-Agent": "DedSecLab"},
         ), timeout=8).read().decode()
         data = json.loads(raw)
     except Exception as exc:
@@ -1843,12 +2160,15 @@ class _TileCover(QLabel):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.mode = "empty"
         self.subtitle = ""
+        self.on_add = None     # main wall sets this: the empty-slot "+" opens Add CCTV
+        self._ring = QRectF()
         self._banner_path = None
         self._banner = None
         self._scaled = None
         self._scaled_key = None
 
     def set_banner(self, path) -> None:
+        mem = path if isinstance(path, _MemBanner) else None
         path = str(path) if path else None
         if path == self._banner_path:
             return
@@ -1857,7 +2177,7 @@ class _TileCover(QLabel):
         self._scaled = None
         self._scaled_key = None
         if path:
-            img = QImage(path)
+            img = QImage.fromData(mem.data) if mem is not None else QImage(path)
             if not img.isNull():
                 if img.width() > 1600:
                     img = img.scaledToWidth(1600, Qt.TransformationMode.SmoothTransformation)
@@ -1868,7 +2188,55 @@ class _TileCover(QLabel):
         self.mode = mode
         self.subtitle = subtitle
         self.setText(title)
+        self._sync_clickable()
         self.update()
+
+    def set_add_handler(self, fn) -> None:
+        self.on_add = fn
+        self._sync_clickable()
+
+    def _add_enabled(self) -> bool:
+        return self.mode == "empty" and self.on_add is not None
+
+    def _sync_clickable(self) -> None:
+        """Only an empty slot with a handler takes the mouse; tiles with a feed stay click-through."""
+        on = self._add_enabled()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not on)
+        self.setMouseTracking(on)
+        self.setToolTip("Add a camera to the wall (opens Add CCTV)" if on else "")
+        if not on:
+            self.unsetCursor()
+
+    def _hit(self, pos) -> bool:
+        return self._add_enabled() and self._ring.adjusted(-6, -6, 6, 6).contains(QPointF(pos))
+
+    def mouseMoveEvent(self, event):
+        if self._add_enabled():
+            if self._hit(event.position()):
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._hit(event.position()):
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._hit(event.position()):
+            event.accept()
+            fn = self.on_add
+            QTimer.singleShot(0, fn)  # after the click has finished (it opens a modal)
+            return
+        super().mouseReleaseEvent(event)
+
+    def event(self, ev):
+        if ev.type() == QEvent.Type.ToolTip and self._add_enabled() and not self._hit(ev.pos()):
+            ev.ignore()
+            return True  # tooltip only over the "+" circle
+        return super().event(ev)
 
     def _cover(self, w: int, h: int):
         if self._banner is None or w <= 0 or h <= 0:
@@ -1931,6 +2299,7 @@ class _TileCover(QLabel):
         top = max(4, (h - total) // 2)
         cx = w / 2
         ring = QRectF(cx - d / 2, top, d, d)
+        self._ring = QRectF(ring)
         fill = QColor(accent)
         fill.setAlpha(34)
         p.setBrush(fill)
@@ -2016,6 +2385,7 @@ class CameraTile(QFrame):
         self.mute_btn = None
         self.info_btn = None
         self.remove_btn = None
+        self.full_btn = None
         self.bar = None
         self.meta_lbl = None
         if not compact:
@@ -2037,6 +2407,10 @@ class CameraTile(QFrame):
             row.addWidget(self.play_btn)
             row.addWidget(self.mute_btn)
             row.addWidget(self.info_btn)
+            if removable:  # main wall: open one feed in its own full-screen window
+                self.full_btn = self._ctl("Full", "expand", "Open this feed in its own full-screen window")
+                row.addWidget(self.full_btn)
+                self.full_btn.hide()
             if removable:
                 self.remove_btn = self._ctl("Remove", "trash", "Take this feed off the wall (it stays in your camera list)")
                 self.remove_btn.setIcon(_glyph_icon("trash", "#ff8a95", 14))
@@ -2100,7 +2474,7 @@ class CameraTile(QFrame):
         _set_prop(self, "hover", "on" if on else "off")
         if self.bar is not None:
             _set_prop(self.bar, "hover", "on" if on else "off")
-            for btn in (self.play_btn, self.mute_btn, self.info_btn, self.remove_btn):
+            for btn in (self.play_btn, self.mute_btn, self.info_btn, self.full_btn, self.remove_btn):
                 if btn is None:
                     continue
                 btn.style().unpolish(btn)
@@ -2126,7 +2500,7 @@ class CameraTile(QFrame):
         self.watermark.raise_()
 
     def _controls(self, visible: bool) -> None:
-        for btn in (self.play_btn, self.mute_btn, self.info_btn):
+        for btn in (self.play_btn, self.mute_btn, self.info_btn, self.full_btn):
             if btn is not None:
                 btn.setVisible(visible)
         if self.remove_btn is not None:  # any slot holding a camera can be cleared (also on error)
@@ -2351,14 +2725,15 @@ class CameraDialog(QDialog):
         title = QLabel("Edit camera" if camera else "New camera")
         title.setObjectName("AcSection")
         layout.addWidget(title)
-        label = QLabel("RTSP address")
+        label = QLabel("Stream address  ·  rtsp://, rtsps://, http:// or https://")
         label.setObjectName("CamField")
         layout.addWidget(label)
         self.rtsp_edit = QLineEdit()
-        self.rtsp_edit.setPlaceholderText("rtsp://192.168.1.20:554/stream1")
+        self.rtsp_edit.setPlaceholderText("rtsp://192.168.1.20:554/stream1  or  https://example.com/live.m3u8")
         self.rtsp_edit.setEchoMode(QLineEdit.EchoMode.Password)
         layout.addWidget(self.rtsp_edit)
-        hint = QLabel("Only an address you add is played. Empty slots stay offline.")
+        hint = QLabel("Only an address you add is played. HTTP(S) works for MJPEG and HLS (.m3u8) streams. "
+                      "Local files and other address types are not accepted.")
         hint.setObjectName("AcMuted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -2459,8 +2834,9 @@ class CameraDialog(QDialog):
 
     def _save(self) -> None:
         rtsp = self.rtsp_edit.text().strip()
-        if not _valid_rtsp(rtsp):
-            QMessageBox.warning(self, "Camera", "Address must start with rtsp:// or rtsps:// and include a host.")
+        if not _valid_custom_url(rtsp):
+            QMessageBox.warning(self, "Camera", "Address must start with rtsp://, rtsps://, http:// or https:// "
+                                "and include a host. Local files and other address types are not accepted.")
             return
         self._camera["rtsp"] = rtsp
         if self._banner_src:
@@ -2488,7 +2864,7 @@ class _MineCard(QFrame):
 
     THUMB_W, THUMB_H = 128, 72
 
-    def __init__(self, dialog: "AddCctvDialog", cam: dict):
+    def __init__(self, dialog: "CustomFeedsDialog", cam: dict):
         super().__init__()
         self.setObjectName("AcCard")
         on_wall = bool(cam.get("pinned"))
@@ -2596,7 +2972,7 @@ class _StreamCard(QFrame):
         lay.addLayout(sub_row)
         btn = QPushButton("On wall · remove" if on_wall else "Add to wall")
         btn.setObjectName("AcOnWall" if on_wall else "AcPrimary")
-        btn.clicked.connect(lambda _=False: dialog._add_country(self.stream_id))
+        btn.clicked.connect(lambda _=False: dialog._add_country(self.stream_id, self._country))
         lay.addWidget(btn)
 
     def set_card_width(self, card_w: int) -> None:
@@ -2613,11 +2989,11 @@ class _StreamCard(QFrame):
         self._name.setText(QFontMetrics(self._bold).elidedText(self._full_name, Qt.TextElideMode.ElideRight, bw))
 
     def mousePressEvent(self, event):
-        self.dialog._select_stream(self.stream_id)
+        self.dialog._select_stream(self.stream_id, self._country)
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        self.dialog._add_country(self.stream_id)
+        self.dialog._add_country(self.stream_id, self._country)
 
 
 class _FlowGrid(QWidget):
@@ -2995,6 +3371,107 @@ class WallFullDialog(QDialog):
         return [cam_id for cam_id, check in self._checks.items() if check.isChecked()]
 
 
+class CustomFeedsDialog(QDialog):
+    """Small window for the user's own feeds (max MAX_CAMERAS), opened from Add CCTV's
+    "My feeds" button. Same frameless title bar as the main window. The actual add / edit /
+    remove / pin logic stays on AddCctvDialog; this window only lists the cards."""
+
+    def __init__(self, owner: "AddCctvDialog"):
+        super().__init__(owner)
+        self.owner = owner
+        self.setObjectName("AddCctv")
+        self.setWindowTitle("My feeds")
+        self.setModal(True)
+        icon = _asset("dedsec_logo.ico", "dedsec_logo.png", "applogo.png")
+        if icon:
+            self.setWindowIcon(QIcon(str(icon)))
+        self.setStyleSheet(_ADD_CCTV_STYLE)
+        self.resize(560, 660)
+        self.setMinimumSize(460, 420)
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        self.title_bar = WindowTitleBar.install(
+            self, "My feeds",
+            '<span style="color:#ffffff">DedSec</span>&nbsp;<span style="color:#22d3ee">CCTV</span>'
+            '&nbsp;&nbsp;<span style="color:#5f7a92">·&nbsp;&nbsp;My feeds</span>')
+        root = QVBoxLayout()
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+        outer.addLayout(root, 1)
+        head = QHBoxLayout()
+        htext = QVBoxLayout()
+        htext.setSpacing(0)
+        lbl = QLabel("My feeds")
+        lbl.setObjectName("AcSection")
+        htext.addWidget(lbl)
+        self.mine_hint = QLabel("")
+        self.mine_hint.setObjectName("AcMuted")
+        htext.addWidget(self.mine_hint)
+        head.addLayout(htext, 1)
+        self.add_btn = QPushButton("+ Add feed")
+        self.add_btn.setObjectName("AcPrimary")
+        self.add_btn.clicked.connect(lambda _=False: self.owner._add())
+        head.addWidget(self.add_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        root.addLayout(head)
+        help_lbl = QLabel(f"Up to {MAX_CAMERAS} of your own cameras. Addresses can be rtsp://, rtsps://, http:// or "
+                          "https:// (MJPEG / HLS). Local files and other address types are not accepted.")
+        help_lbl.setObjectName("AcHelp")
+        help_lbl.setWordWrap(True)
+        root.addWidget(help_lbl)
+        self.mine_scroll = QScrollArea()
+        self.mine_scroll.setWidgetResizable(True)
+        self.mine_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.mine_body = QWidget()
+        self.mine_body.setObjectName("AcScrollBody")
+        self.mine_cards = QVBoxLayout(self.mine_body)
+        self.mine_cards.setContentsMargins(0, 0, 4, 0)
+        self.mine_cards.setSpacing(10)
+        self.mine_scroll.setWidget(self.mine_body)
+        root.addWidget(self.mine_scroll, 1)
+        done_row = QHBoxLayout()
+        done_row.addStretch(1)
+        done = QPushButton("Done")
+        done.setObjectName("AcCyan")
+        done.setMinimumWidth(110)
+        done.clicked.connect(self.accept)
+        done_row.addWidget(done)
+        root.addLayout(done_row)
+        self.reload()
+
+    def reload(self) -> None:
+        value = self.mine_scroll.verticalScrollBar().value()
+        while self.mine_cards.count():
+            item = self.mine_cards.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        mine = self.owner._mine()
+        for cam in mine:
+            self.mine_cards.addWidget(_MineCard(self, cam))
+        if not mine:
+            self.mine_cards.addWidget(_empty_state(
+                "No feeds yet",
+                "Add your own RTSP or HTTP(S) camera with + Add feed. You can give it a banner screenshot too.",
+            ))
+        self.mine_cards.addStretch(1)
+        full = len(mine) >= MAX_CAMERAS
+        self.add_btn.setEnabled(not full)
+        self.add_btn.setToolTip(f"Your own list is full. {MAX_CAMERAS} max." if full else "")
+        self.mine_hint.setText(f"{len(mine)} of {MAX_CAMERAS} saved · RTSP / HTTP / HTTPS")
+        QTimer.singleShot(0, lambda: self.mine_scroll.verticalScrollBar().setValue(value))
+
+    # _MineCard calls these
+    def _edit(self, cam_id: str = "") -> None:
+        self.owner._edit(cam_id)
+
+    def _remove(self, cam_id: str = "") -> None:
+        self.owner._remove(cam_id)
+
+    def _pin(self, cam_id: str = "") -> None:
+        self.owner._pin(cam_id)
+
+
 class AddCctvDialog(QDialog):
     STREAM_BATCH = 48
 
@@ -3013,7 +3490,9 @@ class AddCctvDialog(QDialog):
         self._selected_stream = ""
         self._stream_limit = self.STREAM_BATCH
         self._counts: dict = {}
-        self._source = SOURCE_USER  # user_streams/ ("My streams")
+        self._source = SOURCE_OWNER  # "owner" = DedSec catalog, "user" = user_streams/
+        self._selected_stream_country = ""
+        self._feeds_dlg = None         # CustomFeedsDialog while it is open
         outer = QVBoxLayout(self)
         outer.setSpacing(0)
         # Same frameless window bar as the main window (inserted at the top of ``outer``).
@@ -3038,12 +3517,20 @@ class AddCctvDialog(QDialog):
         title.setObjectName("AcTitle")
         title.setTextFormat(Qt.TextFormat.RichText)
         htext.addWidget(title)
-        note = QLabel("Save up to 4 of your own RTSP cameras, or pick packed streams by country. "
-                      "Up to 4 feeds show on the wall at once.")
+        note = QLabel("Pick packed streams by country, or manage up to 4 of your own feeds (RTSP / HTTP / HTTPS) "
+                      "with My feeds. Up to 4 feeds show on the wall at once.")
         note.setObjectName("AcHelp")
         note.setWordWrap(True)
         htext.addWidget(note)
         hrow.addLayout(htext, 1)
+        self.feeds_btn = QPushButton("My feeds")
+        self.feeds_btn.setObjectName("AcCyan")
+        self.feeds_btn.setIcon(_glyph_icon("camera", "#55c7ff", 14))
+        self.feeds_btn.setIconSize(QSize(14, 14))
+        self.feeds_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.feeds_btn.setToolTip("Add, edit or remove your own feeds (up to 4) in a separate window")
+        self.feeds_btn.clicked.connect(self._open_feeds)
+        hrow.addWidget(self.feeds_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         self.mine_chip = _chip("MINE 0/4", "grey")
         self.wall_chip = _chip("WALL 0/4", "green")
         self.total_chip = _chip("0 STREAMS")
@@ -3054,39 +3541,6 @@ class AddCctvDialog(QDialog):
         body = QHBoxLayout()
         body.setSpacing(12)
 
-        # Left: my cameras ----------------------------------------------------
-        mine_panel = QFrame()
-        mine_panel.setObjectName("AcPanel")
-        mine_panel.setFixedWidth(380)
-        mine = QVBoxLayout(mine_panel)
-        mine.setContentsMargins(14, 14, 14, 14)
-        mine.setSpacing(10)
-        mhead = QHBoxLayout()
-        mtitle = QVBoxLayout()
-        mtitle.setSpacing(0)
-        lbl = QLabel("My cameras")
-        lbl.setObjectName("AcSection")
-        mtitle.addWidget(lbl)
-        self.mine_hint = QLabel("4 max · RTSP you add yourself")
-        self.mine_hint.setObjectName("AcMuted")
-        mtitle.addWidget(self.mine_hint)
-        mhead.addLayout(mtitle, 1)
-        self.add_btn = QPushButton("+ Add camera")
-        self.add_btn.setObjectName("AcPrimary")
-        self.add_btn.clicked.connect(self._add)
-        mhead.addWidget(self.add_btn, 0, Qt.AlignmentFlag.AlignVCenter)
-        mine.addLayout(mhead)
-        self.mine_scroll = QScrollArea()
-        self.mine_scroll.setWidgetResizable(True)
-        self.mine_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.mine_body = QWidget()
-        self.mine_body.setObjectName("AcScrollBody")
-        self.mine_cards = QVBoxLayout(self.mine_body)
-        self.mine_cards.setContentsMargins(0, 0, 4, 0)
-        self.mine_cards.setSpacing(10)
-        self.mine_scroll.setWidget(self.mine_body)
-        mine.addWidget(self.mine_scroll, 1)
-        body.addWidget(mine_panel)
 
         # Right: country catalog ---------------------------------------------
         cat_panel = QFrame()
@@ -3097,8 +3551,23 @@ class AddCctvDialog(QDialog):
 
         picker = QVBoxLayout()
         picker.setSpacing(8)
+        # Source toggle: DedSec catalog (owner, encrypted) / My streams (user_streams/)
+        srow = QHBoxLayout()
+        srow.setSpacing(6)
         self._source_btns = {}
-        clbl = QLabel("My streams")
+        for key, text, tip in ((SOURCE_OWNER, "DedSec catalog", "Streams packed with the app"),
+                               (SOURCE_USER, "My streams", "Your own list in the user_streams folder next to the app")):
+            sb = QPushButton(text)
+            sb.setObjectName("AcFilter")
+            sb.setCheckable(True)
+            sb.setChecked(key == SOURCE_OWNER)
+            sb.setToolTip(tip)
+            sb.setCursor(Qt.CursorShape.PointingHandCursor)
+            sb.clicked.connect(lambda _checked, k=key: self._set_source(k))
+            srow.addWidget(sb)
+            self._source_btns[key] = sb
+        picker.addLayout(srow)
+        clbl = QLabel("Country streams")
         clbl.setObjectName("AcSection")
         self._source_label = clbl
         picker.addWidget(clbl)
@@ -3106,7 +3575,7 @@ class AddCctvDialog(QDialog):
         self.total_label.setObjectName("AcCount")
         picker.addWidget(self.total_label)
         self.country_search = QLineEdit()
-        self.country_search.setPlaceholderText("Search country or stream")
+        self.country_search.setPlaceholderText("Search country")
         self.country_search.setClearButtonEnabled(True)
         self.country_search.textChanged.connect(self._filter_countries)
         picker.addWidget(self.country_search)
@@ -3137,6 +3606,17 @@ class AddCctvDialog(QDialog):
         self.country_hint.setObjectName("AcCount")
         shead.addWidget(self.country_hint)
         streams.addLayout(shead)
+        # Stream search (all countries of the current source): id, name, city, country, IP / host.
+        self.stream_search = QLineEdit()
+        self.stream_search.setObjectName("AcStreamSearch")
+        self.stream_search.setPlaceholderText("Search streams  ·  name, city, country, IP / host or id")
+        self.stream_search.setClearButtonEnabled(True)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(180)  # live, but don't rescan the catalog on every keystroke
+        self._search_timer.timeout.connect(self._on_stream_search)
+        self.stream_search.textChanged.connect(lambda _text: self._search_timer.start())
+        streams.addWidget(self.stream_search)
         # Category filter: All / Traffic cams / Residential
         self._category = "all"
         frow = QHBoxLayout()
@@ -3189,7 +3669,7 @@ class AddCctvDialog(QDialog):
     def _wall_full(self, incoming: str = "") -> bool:
         """Wall is full: offer to take feeds off. Returns True once there is a free slot."""
         wall = [cam for cam in self.page.cameras if cam.get("pinned")]
-        dialog = WallFullDialog(self, wall, incoming)
+        dialog = WallFullDialog(self._ui_parent(), wall, incoming)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return False
         drop = set(dialog.selected_ids())
@@ -3202,32 +3682,40 @@ class AddCctvDialog(QDialog):
         self._refresh_keep_scroll()
         return self._pinned_count() < WALL_SLOTS
 
-    # -- my cameras -----------------------------------------------------------
+    # -- my feeds -------------------------------------------------------------
+    def _ui_parent(self) -> QWidget:
+        """Parent for message boxes / sub-dialogs: the My feeds window while it is open."""
+        dlg = self._feeds_dlg
+        if dlg is not None and not sip.isdeleted(dlg) and dlg.isVisible():
+            return dlg
+        return self
+
+    def _open_feeds(self) -> None:
+        if self._feeds_dlg is not None and not sip.isdeleted(self._feeds_dlg):
+            self._feeds_dlg.raise_()
+            self._feeds_dlg.activateWindow()
+            return
+        dlg = CustomFeedsDialog(self)
+        self._feeds_dlg = dlg
+        try:
+            dlg.exec()
+        finally:
+            self._feeds_dlg = None
+            dlg.deleteLater()
+        self._refresh_keep_scroll()
+
     def _reload(self) -> None:
-        while self.mine_cards.count():
-            item = self.mine_cards.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
         mine = self._mine()
         pinned = self._pinned_count()
-        for cam in mine:
-            self.mine_cards.addWidget(_MineCard(self, cam))
-        if not mine:
-            self.mine_cards.addWidget(_empty_state(
-                "No cameras yet",
-                "Add your own RTSP camera with + Add camera. You can give it a banner screenshot too.",
-            ))
-        self.mine_cards.addStretch(1)
-        self.add_btn.setEnabled(len(mine) < MAX_CAMERAS)
-        self.add_btn.setToolTip("" if len(mine) < MAX_CAMERAS else "Your own list is full. 4 max.")
-        self.mine_hint.setText(f"{len(mine)} of {MAX_CAMERAS} saved · RTSP you add yourself")
+        self.feeds_btn.setText(f"My feeds  {len(mine)}/{MAX_CAMERAS}")
         self.mine_chip.setText(f"MINE {len(mine)}/{MAX_CAMERAS}")
         self.wall_chip.setText(f"WALL {pinned}/{WALL_SLOTS}")
         self.setWindowTitle(f"Add CCTV  ·  mine {len(mine)}/{MAX_CAMERAS}  ·  wall {pinned}/{WALL_SLOTS}")
         self.status.setText("Wall is full. Take a feed off to add another." if pinned >= WALL_SLOTS
                             else f"{WALL_SLOTS - pinned} wall slot{'s' if WALL_SLOTS - pinned != 1 else ''} free.")
+        dlg = self._feeds_dlg
+        if dlg is not None and not sip.isdeleted(dlg):
+            dlg.reload()
         self._reload_country()
 
     # -- countries ------------------------------------------------------------
@@ -3326,20 +3814,46 @@ class AddCctvDialog(QDialog):
         self._stream_limit = self.STREAM_BATCH
         self._render_streams()
 
+    def _on_stream_search(self) -> None:
+        self._stream_limit = self.STREAM_BATCH
+        self._render_streams()
+        self.stream_scroll.verticalScrollBar().setValue(0)
+
+    def _matching_rows(self) -> list:
+        """(country, row) pairs for the grid: stream search (across every country of the source)
+        or the selected country, then the category filter."""
+        source = self._source
+        query = self.stream_search.text().strip().lower()
+        if query:
+            pairs = [(name, row) for name in list(self._counts)
+                     for row in catalog_streams(name, source) if _stream_matches(row, name, query)]
+        else:
+            country = self._selected_country()
+            needle = self.country_search.text().strip().lower()
+            rows = catalog_streams(country, source)
+            if needle and needle not in country.lower():
+                rows = [row for row in rows if needle in f"{row.get('name','')} {row.get('city','')}".lower()]
+            pairs = [(country, row) for row in rows]
+        category = getattr(self, "_category", "all")
+        if category != "all":
+            pairs = [(c, row) for c, row in pairs if row.get("category") == category]
+        return pairs
+
     def _render_streams(self) -> None:
         country = self._selected_country()
+        query_text = self.stream_search.text().strip()
         needle = self.country_search.text().strip().lower()
         on_wall = {cam.get("id") for cam in self.page.cameras if cam.get("pinned")}
         source = self._source
-        rows = catalog_streams(country, source)
-        if needle and needle not in country.lower():
-            rows = [row for row in rows if needle in f"{row.get('name','')} {row.get('city','')}".lower()]
+        pairs = self._matching_rows()
         category = getattr(self, "_category", "all")
-        if category != "all":
-            rows = [row for row in rows if row.get("category") == category]
-        self.country_title.setText(country or "No country match")
-        self.country_hint.setText(f"{len(rows)} available" if country else "")
-        if not rows:
+        if query_text:
+            self.country_title.setText("Search results")
+            self.country_hint.setText(f"{len(pairs)} match{'es' if len(pairs) != 1 else ''}")
+        else:
+            self.country_title.setText(country or "No country match")
+            self.country_hint.setText(f"{len(pairs)} available" if country else "")
+        if not pairs:
             folder_missing = not catalog_available(source)
             sample = ('{"streams": [{"id": "uk-cam-1", "name": "London Bridge", "city": "London",\n'
                       '  "rtsp": "rtsp://…", "banner": "banners/london.jpg"}]}')
@@ -3352,6 +3866,10 @@ class AddCctvDialog(QDialog):
                      "into streams/<Country>/ (for example streams/United Kingdom/)."),
                     sample,
                 )
+            elif query_text:
+                extra = " Switch the filter back to All to widen the search." if category != "all" else ""
+                empty = _empty_state(f"Nothing matches “{query_text}”",
+                                     "No stream name, city, country, IP / host or id contains that text." + extra)
             elif not country:
                 empty = _empty_state("No country matches", "Try another search, or turn off “Only countries with streams”.")
             elif category != "all" and catalog_streams(country, source):
@@ -3371,21 +3889,23 @@ class AddCctvDialog(QDialog):
             else:
                 empty = _empty_state(
                     f"No streams for {country} yet",
-                    "Add some to user_streams/<Country>/streams.json.",
+                    "The DedSec catalog has no streams for this country yet.",
                 )
             empty.setMaximumWidth(520)
             self.stream_grid.set_items([], empty)
             return
-        shown = rows[: self._stream_limit]
-        if self._selected_stream not in {row.get("id") for row in shown}:
+        shown = pairs[: self._stream_limit]
+        if (self._selected_stream_country, self._selected_stream) not in {(c, row.get("id")) for c, row in shown}:
             self._selected_stream = ""
+            self._selected_stream_country = ""
         cards = [
-            _StreamCard(self, country, row, row.get("id") in on_wall, row.get("id") == self._selected_stream)
-            for row in shown
+            _StreamCard(self, c, row, _wall_key(source, c, row.get("id")) in on_wall,
+                        row.get("id") == self._selected_stream and c == self._selected_stream_country)
+            for c, row in shown
         ]
         footer = None
-        if len(rows) > len(shown):
-            footer = QPushButton(f"Show more  ·  {len(rows) - len(shown)} left")
+        if len(pairs) > len(shown):
+            footer = QPushButton(f"Show more  ·  {len(pairs) - len(shown)} left")
             footer.setObjectName("AcCyan")
             footer.clicked.connect(self._more_streams)
         self.stream_grid.set_items(cards, footer)
@@ -3396,18 +3916,18 @@ class AddCctvDialog(QDialog):
         self._render_streams()
         QTimer.singleShot(0, lambda: self.stream_scroll.verticalScrollBar().setValue(value))
 
-    def _select_stream(self, stream_id: str) -> None:
+    def _select_stream(self, stream_id: str, country: str = "") -> None:
         self._selected_stream = stream_id or ""
+        self._selected_stream_country = country or ""
         for card in self.stream_grid.items:
             if isinstance(card, _StreamCard):
-                _set_prop(card, "selected", "true" if card.stream_id == stream_id else "false")
+                hit = card.stream_id == stream_id and card._country == self._selected_stream_country
+                _set_prop(card, "selected", "true" if hit else "false")
 
     def _refresh_keep_scroll(self) -> None:
-        mine_v = self.mine_scroll.verticalScrollBar().value()
         grid_v = self.stream_scroll.verticalScrollBar().value()
-        self._reload()
-        QTimer.singleShot(0, lambda: (self.mine_scroll.verticalScrollBar().setValue(mine_v),
-                                      self.stream_scroll.verticalScrollBar().setValue(grid_v)))
+        self._reload()  # also reloads the My feeds window (it keeps its own scroll position)
+        QTimer.singleShot(0, lambda: self.stream_scroll.verticalScrollBar().setValue(grid_v))
 
     # -- actions --------------------------------------------------------------
     def _selected_id(self) -> str:
@@ -3415,9 +3935,9 @@ class AddCctvDialog(QDialog):
 
     def _add(self) -> None:
         if len(self._mine()) >= MAX_CAMERAS:
-            QMessageBox.information(self, "Add CCTV", "Your own list is full. 4 max.")
+            QMessageBox.information(self._ui_parent(), "Add CCTV", f"Your own list is full. {MAX_CAMERAS} max.")
             return
-        dialog = CameraDialog(self)
+        dialog = CameraDialog(self._ui_parent())
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         cam = dialog.camera()
@@ -3435,7 +3955,7 @@ class AddCctvDialog(QDialog):
         cam = self.page.camera_by_id(cam_id or self._selected_id())
         if not cam or cam.get("source") == "catalog":
             return
-        dialog = CameraDialog(self, cam)
+        dialog = CameraDialog(self._ui_parent(), cam)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated = dialog.camera()
@@ -3474,17 +3994,21 @@ class AddCctvDialog(QDialog):
         self.page.save_and_refresh()
         self._refresh_keep_scroll()
 
-    def _add_country(self, stream_id: str = "") -> None:
-        stream_id = stream_id or self._selected_stream
+    def _add_country(self, stream_id: str = "", country: str | None = None) -> None:
+        if not stream_id:
+            stream_id = self._selected_stream
+            country = country or self._selected_stream_country
         if not stream_id:
             return
+        country = country or self._selected_country()
         self._selected_stream = stream_id
-        country = self._selected_country()
+        self._selected_stream_country = country
         source = self._source
         row = next((entry for entry in catalog_streams(country, source) if entry.get("id") == stream_id), None)
         if not row:
             return
-        existing = self.page.camera_by_id(stream_id)
+        wall_id = _wall_key(source, country, stream_id)
+        existing = self.page.camera_by_id(wall_id)
         if existing:
             if existing.get("pinned"):
                 existing["pinned"] = False
@@ -3500,16 +4024,17 @@ class AddCctvDialog(QDialog):
             existing["rtsp"] = row.get("rtsp") or existing.get("rtsp")
             existing["catalog"] = source
             banner = _stream_banner_path(country, row, source)
-            if banner is not None:
+            if banner is not None and not isinstance(banner, _MemBanner):
                 # Copy into AppData so the main wall still finds it if streams/ moves
-                existing["banner"] = _save_camera_banner(str(banner), stream_id)
+                existing["banner"] = _save_camera_banner(str(banner), wall_id)
             self.page.save_and_refresh()
             self._refresh_keep_scroll()
             return
         if self._pinned_count() >= WALL_SLOTS and not self._wall_full(row.get("name") or country):
             return
         cam = {
-            "id": stream_id,
+            "id": wall_id,
+            "stream_id": stream_id,
             "name": row.get("name") or country,
             "rtsp": row.get("rtsp"),
             "pinned": True,
@@ -3520,8 +4045,9 @@ class AddCctvDialog(QDialog):
             "catalog": source,
         }
         banner = _stream_banner_path(country, row, source)
-        if banner is not None:
-            cam["banner"] = _save_camera_banner(str(banner), stream_id)
+        # Encrypted-catalog banners stay in memory (re-resolved from catalog.dat at runtime).
+        if banner is not None and not isinstance(banner, _MemBanner):
+            cam["banner"] = _save_camera_banner(str(banner), wall_id)
         self.page.cameras.append(cam)
         self.page.save_and_refresh()
         self._refresh_keep_scroll()
@@ -3665,6 +4191,204 @@ class CctvWallWindow(QWidget):
             QTimer.singleShot(0, done)
 
 
+class FeedFullscreenWindow(QWidget):
+    """One wall feed in its own full-screen window (tile "Full" button).
+
+    Same frameless title bar as the app (minimize / maximize-restore / close, edge resize).
+    Esc leaves full screen, or closes the window when it is not full screen; double-click
+    and F11 toggle full screen. It plays on its own pool key, so the wall tile keeps working.
+    However the window goes away (close button, Esc, Alt+F4, the page shutting down) its
+    player is stopped and released (release() is idempotent), so no stream or audio lingers."""
+
+    _seq = 0
+
+    def __init__(self, cam: dict, pool: VlcPool, on_closed=None, parent=None):
+        super().__init__(parent)
+        FeedFullscreenWindow._seq += 1
+        self.key = f"solo-{FeedFullscreenWindow._seq}"
+        self.cam = dict(cam)
+        self.pool = pool
+        self.on_closed = on_closed
+        self._released = False
+        self._muted = False
+        self._was_maximized = False
+        self._attempt = 0
+        name = str(cam.get("name") or "Camera")
+        self.setWindowTitle(f"DedSec CCTV  ·  {name}")
+        self.setObjectName("CctvWallRoot")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        icon = _asset("dedsec_logo.ico", "dedsec_logo.png", "applogo.png")
+        if icon:
+            self.setWindowIcon(QIcon(str(icon)))
+        self.setStyleSheet("""
+            QWidget#CctvWallRoot { background: #050505; }
+            QWidget { color: #e8f0ff; }
+            QFrame#SoloBar { background: #08111b; border: 0; border-top: 1px solid #10202e; }
+            QLabel#SoloName { background: transparent; font-size: 12px; font-weight: 800; }
+            QLabel#SoloHint { color: #8ea0b5; background: transparent; font-family: Consolas, monospace; font-size: 11px; }
+        """ + _TILE_STYLE)
+        self.resize(1280, 760)
+        self.setMinimumSize(480, 300)
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        self.title_bar = WindowTitleBar.install(self, self.windowTitle())
+        # VLC draws into this native child window (same setup as CameraTile.video).
+        self.video = QFrame()
+        self.video.setObjectName("CctvVideo")
+        self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.video.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        outer.addWidget(self.video, 1)
+        self.cover = _TileCover(self.video)
+        self.cover.set_banner(_camera_banner_path(cam))
+        self.video.installEventFilter(self)
+        self.cover.installEventFilter(self)
+        bar = QFrame()
+        bar.setObjectName("SoloBar")
+        bar.setFixedHeight(40)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 6, 8, 6)
+        row.setSpacing(6)
+        name_lbl = QLabel(name)
+        name_lbl.setObjectName("SoloName")
+        name_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(name_lbl, 1)
+        hint = QLabel("ESC · EXIT FULL SCREEN   DOUBLE-CLICK · TOGGLE")
+        hint.setObjectName("SoloHint")
+        row.addWidget(hint)
+        self.mute_btn = CameraTile._ctl("Mute", "sound", "Mute / unmute audio")
+        self.mute_btn.clicked.connect(lambda _=False: self.toggle_mute())
+        self.fs_btn = CameraTile._ctl("Full screen", "expand", "Toggle full screen (double-click, F11)")
+        self.fs_btn.clicked.connect(lambda _=False: self.toggle_fullscreen())
+        row.addWidget(self.mute_btn)
+        row.addWidget(self.fs_btn)
+        outer.addWidget(bar)
+        for seq, slot in ((Qt.Key.Key_Escape, self._on_escape), (Qt.Key.Key_F11, self.toggle_fullscreen)):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(slot)
+        self._start_timer = QTimer(self)
+        self._start_timer.setSingleShot(True)
+        self._start_timer.timeout.connect(self._start)
+        self._show_cover("ready", "Connecting…", str(cam.get("country") or ""))
+
+    # -- playback ---------------------------------------------------------------
+    def start(self, delay_ms: int = 300) -> None:
+        """Begin playback once the window (and its native video surface) is on screen."""
+        if not self._released:
+            self._start_timer.start(max(0, int(delay_ms)))
+
+    def _start(self) -> None:
+        if self._released or self.pool is None:
+            return
+        if not self.pool.ready:
+            self._show_cover("error", "Video engine unavailable", str(self.pool.detail or ""))
+            return
+        self.video.winId()
+        ok = self.pool.play(self.key, str(self.cam.get("rtsp") or ""), self.video, on_fail=self._failed)
+        if not ok:
+            self._failed()
+            return
+        player = self.pool._players.get(self.key)
+        if player is not None:
+            try:  # let Qt (not VLC) receive double-clicks / keys over the video
+                player.video_set_mouse_input(False)
+                player.video_set_key_input(False)
+            except Exception:
+                pass
+        self.cover.hide()
+
+    def _failed(self) -> None:
+        """Connect failure: one fresh retry, then "Failed to connect" and close the window."""
+        if self._released or self.pool is None:
+            return
+        self.pool.stop(self.key)  # release the failed player
+        if self._attempt < 1:
+            self._attempt += 1
+            self._show_cover("ready", "Connecting…", "Retrying")
+            self.start(800)
+            return
+        self._show_cover("error", "Failed to connect")  # never the VLC error text or URL
+        closer = QTimer(self)  # child timer: dies with the window if it is closed first
+        closer.setSingleShot(True)
+        closer.timeout.connect(self.close)
+        closer.start(2500)
+
+    def toggle_mute(self) -> None:
+        player = self.pool._players.get(self.key) if self.pool is not None else None
+        if player is None:
+            return
+        self._muted = not self._muted
+        try:
+            player.audio_set_mute(self._muted)
+        except Exception:
+            pass
+        self.mute_btn.setText("Muted" if self._muted else "Mute")
+        self.mute_btn.setIcon(_glyph_icon("mute" if self._muted else "sound",
+                                          "#7dffb0" if self._muted else "#cfe3f2", 14))
+        _paint_btn(self.mute_btn, self._muted)
+
+    def release(self, wait: float = 2.0) -> None:
+        """Force-disconnect: stop and release this window's player. Safe to call repeatedly."""
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._start_timer.stop()
+        except Exception:
+            pass
+        pool, self.pool = self.pool, None
+        if pool is not None:
+            try:
+                # Bounded wait so VLC lets go of the video window before Qt destroys it.
+                # stop_keys() also drops a pending IPCamLive lookup token for this key.
+                pool.stop_keys([self.key], wait=wait)
+            except Exception:
+                pass
+
+    # -- window behaviour -------------------------------------------------------
+    def _show_cover(self, mode: str, title: str, subtitle: str = "") -> None:
+        self.cover.set_state(mode, title, subtitle)
+        self.cover.setGeometry(0, 0, self.video.width(), self.video.height())
+        self.cover.show()
+        self.cover.raise_()
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showMaximized() if self._was_maximized else self.showNormal()
+        else:
+            self._was_maximized = self.isMaximized()
+            self.showFullScreen()
+
+    def _on_escape(self) -> None:
+        if self.isFullScreen():
+            self.toggle_fullscreen()
+        else:
+            self.close()
+
+    def eventFilter(self, obj, event):
+        if obj in (getattr(self, "video", None), getattr(self, "cover", None)) and event.type() == QEvent.Type.MouseButtonDblClick:
+            self.toggle_fullscreen()
+            return True
+        return super().eventFilter(obj, event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.toggle_fullscreen()
+        event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.cover.setGeometry(0, 0, self.video.width(), self.video.height())
+
+    def closeEvent(self, event):
+        self.release()
+        done = self.on_closed
+        self.on_closed = None
+        super().closeEvent(event)
+        if done:
+            QTimer.singleShot(0, lambda w=self: done(w))
+
+
 # ---------------------------------------------------------------------------
 # Settings page (header gear button)
 # ---------------------------------------------------------------------------
@@ -3791,6 +4515,9 @@ _SETTINGS_STYLE = """
     QLabel#CardValue { color: #e8f0ff; font-size: 13px; font-family: Consolas, monospace; background: transparent; }
     QLabel#CurrentBadge { background: #22d3ee; color: #06202a; border-radius: 9px; padding: 1px 9px;
         font-size: 10px; font-weight: 800; letter-spacing: 1px; }
+    QLabel#NewsTitle { color: #ffffff; font-size: 14px; font-weight: 800; background: transparent; }
+    QLabel#NewsMeta { color: #22d3ee; font-family: Consolas, monospace; font-size: 11px; font-weight: 700; background: transparent; }
+    QLabel#NewsBody { color: #c5d2e0; font-size: 12px; background: transparent; }
     QLabel#OkBadge { background: #14361f; color: #7dffb0; border-radius: 9px; padding: 2px 10px; font-size: 11px; font-weight: 800; }
     QLabel#WarnBadge { background: #2a2210; color: #fcd34d; border-radius: 9px; padding: 2px 10px; font-size: 11px; font-weight: 800; }
     QFrame#SettingsDivider { background: #16324a; border: none; max-height: 1px; min-height: 1px; }
@@ -3815,9 +4542,10 @@ _SETTINGS_STYLE = """
 
 
 class SettingsDialog(QDialog):
-    """Modal settings page: Appearance (themes), Account, About."""
+    """Modal settings page: Appearance (themes), Account, Updates (news), About."""
 
-    SECTIONS = (("appearance", "Appearance", "gear"), ("account", "Account", "user"), ("about", "About", "info"))
+    SECTIONS = (("appearance", "Appearance", "gear"), ("account", "Account", "user"),
+                ("updates", "Updates", "camera"), ("about", "About", "info"))
 
     def __init__(self, parent=None, account=None, section: str = "appearance"):
         super().__init__(parent)
@@ -3856,7 +4584,8 @@ class SettingsDialog(QDialog):
         sl.addWidget(sub)
         self.stack = QStackedWidget()
         self.nav: dict = {}
-        builders = {"appearance": self._build_appearance, "account": self._build_account, "about": self._build_about}
+        builders = {"appearance": self._build_appearance, "account": self._build_account,
+                    "updates": self._build_updates, "about": self._build_about}
         for key, label, icon in self.SECTIONS:
             btn = QPushButton("  " + label)
             btn.setObjectName("SettingsNav")
@@ -3962,6 +4691,88 @@ class SettingsDialog(QDialog):
         b.clicked.connect(lambda _=False: slot())
         return b
 
+    # -- Updates (announcements + changelogs) -----------------------------------
+    def _build_updates(self) -> QWidget:
+        w, lay = self._page("Updates", "Announcements and changelogs from DedSec. Loaded from the DedSec update "
+                                       "server and checked against the app's signing key.")
+        top = QHBoxLayout()
+        self.news_status = self._label("Loading…", "CardText")
+        top.addWidget(self.news_status, 1)
+        self.news_btn = self._button("Refresh", "SettingsSecondary", self._load_news)
+        top.addWidget(self.news_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        lay.addLayout(top)
+        self.news_boxes = {}
+        for kind, label in (("announcement", "ANNOUNCEMENTS"), ("changelog", "CHANGELOGS")):
+            lay.addWidget(self._label(label, "SettingsGroup"))
+            box = QVBoxLayout()
+            box.setSpacing(10)
+            lay.addLayout(box)
+            self.news_boxes[kind] = box
+        lay.addStretch(1)
+        cached = load_cached_news()
+        self._render_news(cached, True)
+        QTimer.singleShot(0, self._load_news)
+        return w
+
+    def _load_news(self) -> None:
+        self.news_btn.setEnabled(False)
+        self.news_status.setText("Checking for news…")
+
+        def done(result) -> None:
+            if sip.isdeleted(self):
+                return
+            feed, from_cache = result
+            self._render_news(feed, from_cache)
+
+        def fail(_exc) -> None:
+            if not sip.isdeleted(self):
+                self._render_news(load_cached_news(), True)
+        self._news_task = run_bg(fetch_news, done, fail)
+
+    def _render_news(self, feed, from_cache: bool) -> None:
+        self.news_btn.setEnabled(True)
+        for kind, box in self.news_boxes.items():
+            while box.count():
+                item = box.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            items = [it for it in (feed or {}).get("items", []) if it["type"] == kind]
+            if not items:
+                card, cl = self._card()
+                cl.addWidget(self._label("Nothing here yet." if feed else "Not available offline yet.", "CardText"))
+                box.addWidget(card)
+            for it in items:
+                box.addWidget(self._news_card(it))
+        if feed is None:
+            self.news_status.setText("Couldn't reach the update server. Check your connection and press Refresh.")
+        elif from_cache:
+            self.news_status.setText("Offline: showing the last saved news.")
+        else:
+            self.news_status.setText("Up to date.")
+
+    def _news_card(self, it: dict) -> QFrame:
+        card, cl = self._card()
+        cl.setSpacing(6)
+        title = QLabel(it["title"])
+        title.setObjectName("NewsTitle")
+        title.setTextFormat(Qt.TextFormat.PlainText)
+        title.setWordWrap(True)
+        cl.addWidget(title)
+        meta = QLabel("  ·  ".join(x for x in (it["date"], f"v{it['version']}" if it["version"] else "") if x))
+        meta.setObjectName("NewsMeta")
+        meta.setTextFormat(Qt.TextFormat.PlainText)
+        cl.addWidget(meta)
+        if it["body"].strip():
+            body = QLabel()
+            body.setObjectName("NewsBody")
+            body.setTextFormat(Qt.TextFormat.RichText)  # escaped by news_body_html: no remote HTML
+            body.setOpenExternalLinks(False)
+            body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            body.setWordWrap(True)
+            body.setText(news_body_html(it["body"]))
+            cl.addWidget(body)
+        return card
+
     # -- Appearance ------------------------------------------------------------
     def _build_appearance(self) -> QWidget:
         w, lay = self._page("Appearance", "Pick a theme. It applies instantly to every window and is remembered next time.")
@@ -4051,6 +4862,17 @@ class SettingsDialog(QDialog):
                                    "Off. Add a code from an authenticator app to every sign-in.", self.tfa_btn))
         lay.addWidget(card)
 
+        lay.addWidget(self._label("EMAIL", "SettingsGroup"))
+        card, cl = self._card()
+        self.updates_box = QCheckBox("On")
+        self.updates_box.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.updates_box.setEnabled(False)
+        cl.addWidget(self._row("Email me product updates", "Release notes and announcements, at most a few a month. "
+                               "Account and security emails are always sent.", self.updates_box))
+        lay.addWidget(card)
+        if self.account is not None and user is not None:
+            run_bg(lambda: auth_client().get_email_updates(), self._updates_loaded, lambda _e: None)
+
         lay.addWidget(self._label("SESSION", "SettingsGroup"))
         card, cl = self._card()
         self.signout_btn = self._button("Sign out", "SettingsDanger", lambda: self._defer("sign_out"))
@@ -4059,6 +4881,33 @@ class SettingsDialog(QDialog):
         lay.addWidget(card)
         lay.addStretch(1)
         return w
+
+    def _updates_loaded(self, on: bool) -> None:
+        try:
+            self.updates_box.blockSignals(True)
+            self.updates_box.setChecked(bool(on))
+            self.updates_box.blockSignals(False)
+            self.updates_box.setEnabled(True)
+            self.updates_box.toggled.connect(self._updates_toggled)
+        except RuntimeError:  # dialog already closed
+            pass
+
+    def _updates_toggled(self, on: bool) -> None:
+        self.updates_box.setEnabled(False)
+
+        def done(val: bool) -> None:
+            try:
+                self.updates_box.blockSignals(True)
+                self.updates_box.setChecked(bool(val))
+                self.updates_box.blockSignals(False)
+                self.updates_box.setEnabled(True)
+            except RuntimeError:
+                pass
+
+        def fail(_exc) -> None:
+            done(not on)  # revert on error
+
+        run_bg(lambda: auth_client().set_email_updates(on), done, fail)
 
     def _defer(self, method: str) -> None:
         """Account handlers tear down the CCTV page, so close Settings first and run them after."""
@@ -4076,6 +4925,30 @@ class SettingsDialog(QDialog):
         cl.addWidget(self._divider())
         host = urlparse(API_BASE_URL).netloc or API_BASE_URL
         cl.addWidget(self._row("Server", "Account and update server.", self._label(host, "CardValue")))
+        cl.addWidget(self._divider())
+        self.conn_value = self._label(connection_label(_NET_STATUS.get("vpn")), "CardValue")
+        self.conn_btn = self._button("Check", "SettingsSecondary", self._check_connection)
+        right = QWidget()
+        rh = QHBoxLayout(right)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(12)
+        rh.addWidget(self.conn_value, 0, Qt.AlignmentFlag.AlignVCenter)
+        rh.addWidget(self.conn_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        cl.addWidget(self._row("Connection", "Whether your connection looks like a VPN. "
+                               "We recommend one for privacy.", right))
+        cl.addWidget(self._divider())
+        cl.addWidget(self._row("Terms of use", "How DedSec CCTV may be used.",
+                               self._button("View terms", "SettingsSecondary", lambda: show_terms(self))))
+        cl.addWidget(self._divider())
+        self.install_btn = self._button("Open install folder", "SettingsSecondary", lambda: open_install_folder(self))
+        self.install_btn.setToolTip(str(install_dir()))
+        cl.addWidget(self._row("Install folder", "Where DedSec CCTV is installed on this PC.", self.install_btn))
+        lay.addWidget(card)
+
+        lay.addWidget(self._label("COMMUNITY", "SettingsGroup"))
+        card, cl = self._card()
+        cl.addWidget(self._row("Discord", "News, help and bug bounty tickets.",
+                               self._button("Join our Discord", "SettingsSecondary", open_discord)))
         lay.addWidget(card)
 
         lay.addWidget(self._label("UPDATES", "SettingsGroup"))
@@ -4097,6 +4970,19 @@ class SettingsDialog(QDialog):
         lay.addWidget(card)
         lay.addStretch(1)
         return w
+
+    def _check_connection(self) -> None:
+        self.conn_btn.setEnabled(False)
+        self.conn_value.setText("Checking\u2026")
+
+        def done(res) -> None:
+            try:
+                self.conn_btn.setEnabled(True)
+                self.conn_value.setText(connection_label(res.get("vpn") if isinstance(res, dict) else None))
+            except RuntimeError:
+                pass
+
+        run_bg(check_connection, done, lambda _e: done(None))
 
     def _check_updates(self) -> None:
         self.update_btn.setEnabled(False)
@@ -4124,6 +5010,79 @@ class SettingsDialog(QDialog):
 
 
 class CctvPage(QWidget):
+    VPN_BANNER_CSS = (
+        "QFrame#VpnBanner { background: #2a2210; border-bottom: 1px solid #b45309; }"
+        "QLabel#VpnBannerText { color: #fcd34d; font-size: 13px; font-weight: 600; background: transparent; }"
+        "QPushButton#VpnBtn { background: #f59e0b; color: #1a1205; border: none; border-radius: 6px;"
+        " padding: 5px 12px; font-weight: 700; }"
+        "QPushButton#VpnBtn:hover { background: #fbbf24; }"
+        "QPushButton#VpnBtnGhost { background: transparent; color: #fcd34d; border: 1px solid #b45309;"
+        " border-radius: 6px; padding: 5px 12px; font-weight: 600; }"
+        "QPushButton#VpnBtnGhost:hover { background: #3a2e12; }"
+        "QPushButton#VpnClose { background: transparent; color: #fcd34d; border: none; font-size: 15px; padding: 2px 6px; }"
+    )
+
+    def _build_vpn_banner(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("VpnBanner")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        bar.setStyleSheet(self.VPN_BANNER_CSS)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(14, 7, 10, 7)
+        h.setSpacing(8)
+        icon = QLabel()
+        icon.setPixmap(_glyph_icon("info", "#fcd34d", 16).pixmap(16, 16))
+        icon.setStyleSheet("background: transparent;")
+        h.addWidget(icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        txt = QLabel("You don't appear to be using a VPN. For your privacy we recommend "
+                     "connecting to one before viewing cameras.")
+        txt.setObjectName("VpnBannerText")
+        txt.setWordWrap(True)
+        h.addWidget(txt, 1)
+
+        def mk(text, name, slot, tip=""):
+            b = QPushButton(text)
+            b.setObjectName(name)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            if tip:
+                b.setToolTip(tip)
+            b.clicked.connect(lambda _=False: slot())
+            h.addWidget(b, 0, Qt.AlignmentFlag.AlignVCenter)
+            return b
+
+        mk("Get a free VPN", "VpnBtn", lambda: open_url(VPN_DOWNLOAD_URL), "Opens windscribe.com/download in your browser")
+        self.vpn_recheck_btn = mk("Check again", "VpnBtnGhost", self.start_vpn_check)
+        mk("Don't show again", "VpnBtnGhost", self._vpn_never)
+        mk("\u2715", "VpnClose", lambda: bar.hide(), "Dismiss")
+        bar.hide()
+        self.vpn_banner = bar
+        return bar
+
+    def start_vpn_check(self) -> None:
+        """Non-blocking: runs check_connection() on a worker thread (5 s timeout)."""
+        if bool(load_settings().get("vpn_banner_hidden")):
+            return
+        btn = getattr(self, "vpn_recheck_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("Checking\u2026")
+
+        def done(res) -> None:
+            try:
+                if btn is not None:
+                    btn.setEnabled(True)
+                    btn.setText("Check again")
+                show = isinstance(res, dict) and res.get("vpn") is False
+                self.vpn_banner.setVisible(show and not bool(load_settings().get("vpn_banner_hidden")))
+            except RuntimeError:  # page already closed
+                pass
+
+        run_bg(check_connection, done, lambda _e: done({"vpn": None}))
+
+    def _vpn_never(self) -> None:
+        save_setting("vpn_banner_hidden", True)
+        self.vpn_banner.hide()
+
     def __init__(self, app_window=None, account=None):
         super().__init__()
         self.app_window = app_window
@@ -4131,6 +5090,9 @@ class CctvPage(QWidget):
         self.cameras: list[dict] = []
         self.pool = VlcPool()
         self._wall = None
+        self._solos: list = []  # FeedFullscreenWindow instances (one feed each)
+        self._attempts: dict = {}     # cam id -> connection attempts for the current Play
+        self._fail_timers: dict = {}  # ("retry"|"drop", cam id) -> QTimer
         self._closing = False
         self._build()
         self._apply_style()
@@ -4144,6 +5106,7 @@ class CctvPage(QWidget):
         accent.setObjectName("CctvAccent")
         accent.setFixedHeight(2)
         outer.addWidget(accent)
+        outer.addWidget(self._build_vpn_banner())
         body = QWidget()
         body.setObjectName("CctvBody")
         outer.addWidget(body, 1)
@@ -4229,6 +5192,13 @@ class CctvPage(QWidget):
         self.settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_btn.setToolTip("Appearance, account and app settings")
         self.settings_btn.clicked.connect(self.open_settings)
+        self.discord_btn = QPushButton("Discord")
+        self.discord_btn.setObjectName("ActionButton_settings")
+        self.discord_btn.setFixedHeight(34)
+        self.discord_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.discord_btn.setToolTip("Join the DedSec Discord (opens your browser)")
+        self.discord_btn.clicked.connect(lambda _=False: open_discord())
+        header.addWidget(self.discord_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(self.settings_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addWidget(banner)
 
@@ -4241,6 +5211,7 @@ class CctvPage(QWidget):
         self.tiles = []
         for index in range(WALL_SLOTS):
             tile = CameraTile(index + 1, removable=True)
+            tile.watermark.set_add_handler(self.open_library)
             self.tiles.append(tile)
             grid.addWidget(tile, index // 2, index % 2)
         grid.setRowStretch(0, 1)
@@ -4252,8 +5223,12 @@ class CctvPage(QWidget):
         foot = QHBoxLayout()
         foot.setContentsMargins(4, 0, 4, 0)
         foot.setSpacing(8)
-        self.hint_lbl = QLabel("Press Play on a feed to go live  ·  Full screen moves live feeds to a dedicated wall  ·  Esc returns")
+        self._hint_text = "Press Play on a feed to go live  ·  Full screen moves live feeds to a dedicated wall  ·  Esc returns"
+        self.hint_lbl = QLabel(self._hint_text)
         self.hint_lbl.setObjectName("StatusLine")
+        self._hint_timer = QTimer(self)
+        self._hint_timer.setSingleShot(True)
+        self._hint_timer.timeout.connect(lambda: self.hint_lbl.setText(self._hint_text))
         self.hint_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         engine = QLabel(("VLC ready" if self.pool.ready else "VLC unavailable") + f"  ·  v{APP_VERSION}")
         engine.setObjectName("StatusVersion")
@@ -4294,7 +5269,7 @@ class CctvPage(QWidget):
         def num(n, text):
             return f'<span style="color:{ok if n else muted}">{text}</span>'
         dot = "#2fbf6a" if live else "#3c4a5c"
-        pinned = len(getattr(self, "_pinned", []) or [])
+        pinned = sum(1 for cam in (getattr(self, "_pinned", []) or []) if cam)
         total = int(getattr(self, "_catalog_total", 0) or 0)
         html = (f'<span style="color:{dot}">●</span>&nbsp;<span style="color:{label}">LIVE</span>&nbsp;'
                 + num(live, f"{live}/{WALL_SLOTS}"))
@@ -4370,10 +5345,17 @@ class CctvPage(QWidget):
                         "pinned": bool(row.get("pinned")),
                         "source": source,
                     }
-                    for extra in ("country", "country_code", "banner"):
+                    for extra in ("country", "country_code", "banner", "catalog", "stream_id", "category"):
                         value = row.get(extra)
                         if isinstance(value, str) and value.strip():
                             cam[extra] = value.strip()[:400]
+                    if source == "catalog" and not cam["id"].startswith("cat-"):
+                        # Older builds used the bare catalog row id, which repeats across
+                        # countries: migrate to the unique wall key.
+                        cam["stream_id"] = cam["id"]
+                        cam["id"] = _wall_key(cam.get("catalog") or SOURCE_OWNER, cam.get("country", ""), cam["id"])
+                    if any(c.get("id") == cam["id"] for c in self.cameras):
+                        continue  # duplicate after migration
                     self.cameras.append(cam)
             except Exception:
                 self.cameras = []
@@ -4405,39 +5387,79 @@ class CctvPage(QWidget):
                 return cam
         return None
 
+    @staticmethod
+    def _slot_sig(cam) -> tuple | None:
+        """What a slot is showing; a change of address means its player must restart."""
+        return (cam.get("id"), cam.get("rtsp")) if cam else None
+
     def refresh(self) -> None:
+        """Sync the wall with the pinned cameras *in place*.
+
+        Slots are stable: a camera that stays pinned keeps its tile, its player and its video
+        widget untouched (no stop / restart / re-set hwnd, so no flash). Only slots whose camera
+        left get cleared, and newly pinned cameras fill free slots."""
         if self._wall is not None or self._closing:
             return
-        self.pool.stop_all()
+        pinned = [cam for cam in self.cameras if cam.get("pinned")][:WALL_SLOTS]
+        by_id = {cam.get("id"): cam for cam in pinned}
+        old = list(getattr(self, "_pinned", None) or [])
+        old += [None] * (WALL_SLOTS - len(old))
+        slots = [None] * WALL_SLOTS
+        for i, cam in enumerate(old[:WALL_SLOTS]):  # keep cameras where they already are
+            if cam and cam.get("id") in by_id:
+                slots[i] = by_id.pop(cam.get("id"))
+        free = [i for i in range(WALL_SLOTS) if slots[i] is None]
+        for cam in [c for c in pinned if c.get("id") in by_id]:  # newcomers: first free slots
+            if free:
+                slots[free.pop(0)] = cam
+        changed = [i for i in range(WALL_SLOTS) if self._slot_sig(slots[i]) != getattr(self, "_slot_sigs", [None] * WALL_SLOTS)[i]
+                   or not getattr(self, "_armed", False)]
+        # Stop only the players of slots that changed. Solo windows ("solo-*") own their players.
+        stop = [f"wall-{i}" for i in changed if f"wall-{i}" in self.pool._players]
+        for i in changed:
+            if old[i]:
+                self._cancel_fail_timers("retry", old[i].get("id"))
+                self._attempts.pop(old[i].get("id"), None)
+        if stop:
+            self.pool.stop_keys(stop, wait=1.5)
         if self._closing:  # torn down while waiting for the players to stop
             return
-        pinned = [cam for cam in self.cameras if cam.get("pinned")][:WALL_SLOTS]
-        self._pinned = pinned
-        for index, tile in enumerate(self.tiles):
-            cam = pinned[index] if index < len(pinned) else None
-            for btn in (tile.play_btn, tile.mute_btn, tile.info_btn, tile.remove_btn):
-                if btn is None:
-                    continue
-                try:  # drop old slots so repeated refreshes don't stack (mute fired twice = no-op)
-                    btn.clicked.disconnect()
-                except Exception:
-                    pass
-            if not cam:
-                tile.show_empty()
-                continue
-            tile.set_camera(cam)
-            if tile.remove_btn is not None:
-                tile.remove_btn.clicked.connect(lambda _=False, i=index: self.remove_from_wall(i))
-            if not self.pool.ready:
-                tile.show_error(self.pool.detail)
-                continue
-            tile.show_ready()
-            tile.play_btn.clicked.connect(lambda _=False, i=index: self.toggle_play(i))
-            tile.mute_btn.clicked.connect(lambda _=False, i=index: self.toggle_mute(i, not getattr(self.tiles[i], '_muted', False)))
-            tile.info_btn.clicked.connect(lambda _=False, i=index: self.show_info(i))
+        self._pinned = slots
+        self._slot_sigs = [self._slot_sig(cam) for cam in slots]
+        self._armed = True
+        for index in range(WALL_SLOTS):
+            if index in changed:
+                self._arm_tile(index, slots[index])
+            elif slots[index]:
+                self.tiles[index].set_camera(slots[index])  # name / banner edits; player untouched
         _counts, total = stream_counts()
         self._catalog_total = total
         self._update_status()
+
+    def _arm_tile(self, index: int, cam) -> None:
+        tile = self.tiles[index]
+        for btn in (tile.play_btn, tile.mute_btn, tile.info_btn, tile.full_btn, tile.remove_btn):
+            if btn is None:
+                continue
+            try:  # drop old slots so repeated arming doesn't stack (mute fired twice = no-op)
+                btn.clicked.disconnect()
+            except Exception:
+                pass
+        if not cam:
+            tile.show_empty()
+            return
+        tile.set_camera(cam)
+        if tile.remove_btn is not None:
+            tile.remove_btn.clicked.connect(lambda _=False, i=index: self.remove_from_wall(i))
+        if not self.pool.ready:
+            tile.show_error(self.pool.detail)
+            return
+        tile.show_ready()
+        tile.play_btn.clicked.connect(lambda _=False, i=index: self.toggle_play(i))
+        tile.mute_btn.clicked.connect(lambda _=False, i=index: self.toggle_mute(i, not getattr(self.tiles[i], '_muted', False)))
+        tile.info_btn.clicked.connect(lambda _=False, i=index: self.show_info(i))
+        if tile.full_btn is not None:
+            tile.full_btn.clicked.connect(lambda _=False, i=index: self.open_feed_fullscreen(i))
 
     def toggle_mute(self, index: int, checked: bool) -> None:
         player = self.pool._players.get(f"wall-{index}")
@@ -4456,23 +5478,15 @@ class CctvPage(QWidget):
 
     def remove_from_wall(self, index: int) -> None:
         """Tile 'Remove': stop that feed and take it off the wall. The camera stays saved in the
-        list (same as WallFullDialog). Feeds still playing in other slots are resumed."""
+        list (same as WallFullDialog). Only this slot is cleared; other tiles keep playing untouched."""
         if self._wall is not None or self._closing:
             return
         cam = self._pinned[index] if index < len(getattr(self, "_pinned", [])) else None
         if not cam:
             return
-        self.pool.stop_keys([f"wall-{index}"], wait=1.5)
-        playing = {self._pinned[i].get("id") for i in range(len(self._pinned))
-                   if i != index and f"wall-{i}" in self.pool._players}
+        self._cancel_fail_timers(cam_id=cam.get("id"))
         cam["pinned"] = False
-        self.save_and_refresh()  # persist + re-lay the wall + counts
-        if self._closing:
-            return
-        for i, row in enumerate(self._pinned):
-            if row.get("id") in playing and f"wall-{i}" not in self.pool._players:
-                self.toggle_play(i)
-        self._update_status()
+        self.save_and_refresh()  # persist; refresh() clears just this slot (stops only its player)
 
     def toggle_play(self, index: int) -> None:
         if self._wall is not None or self._closing:
@@ -4482,18 +5496,119 @@ class CctvPage(QWidget):
             return
         tile = self.tiles[index]
         key = f"wall-{index}"
-        if key in self.pool._players:
+        cam_id = cam.get("id")
+        if key in self.pool._players or ("retry", cam_id) in self._fail_timers:
+            self._cancel_fail_timers(cam_id=cam_id)
             self.pool.stop(key)
             tile.show_ready()
             self._update_status()
             return
+        if ("drop", cam_id) in self._fail_timers:
+            return  # already failed twice; leaving the wall
+        self._attempts[cam_id] = 0
+        self._start_wall_feed(index)
+
+    def _start_wall_feed(self, index: int) -> None:
+        cam = self._pinned[index]
+        tile = self.tiles[index]
+        key = f"wall-{index}"
+        cam_id = cam.get("id")
         tile.video.winId()
-        ok = self.pool.play(key, cam.get("rtsp", ""), tile.video)
+        ok = self.pool.play(key, cam.get("rtsp", ""), tile.video,
+                            on_fail=lambda i=index, c=cam_id: self._wall_feed_failed(i, c))
         if ok:
             tile.show_live()
         else:
-            tile.show_error("STREAM FAILED")
+            self._wall_feed_failed(index, cam_id)
         self._update_status()
+
+    # -- connect failure: retry once, then take the feed off the wall ---------------
+    def _index_of(self, cam_id) -> int:
+        for i, cam in enumerate(getattr(self, "_pinned", []) or []):
+            if cam and cam.get("id") == cam_id:
+                return i
+        return -1
+
+    def _fail_timer(self, kind: str, cam_id, ms: int, fn) -> None:
+        self._cancel_fail_timers(kind, cam_id)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(fn)
+        self._fail_timers[(kind, cam_id)] = timer
+        timer.start(ms)
+
+    def _cancel_fail_timers(self, kind: str = "", cam_id=None) -> None:
+        for k in list(self._fail_timers):
+            if (not kind or k[0] == kind) and (cam_id is None or k[1] == cam_id):
+                timer = self._fail_timers.pop(k)
+                try:
+                    timer.stop()
+                    timer.deleteLater()
+                except RuntimeError:
+                    pass
+
+    def _wall_feed_failed(self, index: int, cam_id) -> None:
+        if self._closing or self._wall is not None or self._index_of(cam_id) != index:
+            return  # tile changed / removed / app closing meanwhile
+        key = f"wall-{index}"
+        tile = self.tiles[index]
+        self.pool.stop(key)  # release the failed player before anything else
+        if self._attempts.get(cam_id, 0) < 1:
+            self._attempts[cam_id] = 1
+            tile.show_live()  # stays on "CONNECTING" while the fresh attempt starts
+
+            def retry(c=cam_id):
+                self._fail_timers.pop(("retry", c), None)
+                i = self._index_of(c)  # the wall may have been re-laid meanwhile
+                if self._closing or self._wall is not None or i < 0 or f"wall-{i}" in self.pool._players:
+                    return
+                self._start_wall_feed(i)
+            self._fail_timer("retry", cam_id, 800, retry)
+        else:
+            self._attempts.pop(cam_id, None)
+            tile.show_error("Failed to connect")  # generic: never the VLC error text or the URL
+            self._fail_timer("drop", cam_id, 3000, lambda c=cam_id: self._drop_failed(c))
+        self._update_status()
+
+    def _drop_failed(self, cam_id) -> None:
+        self._fail_timers.pop(("drop", cam_id), None)
+        if self._closing or self._wall is not None:
+            return
+        index = self._index_of(cam_id)
+        if index < 0:
+            return  # already gone (user removed it)
+        # Only the wall selection changes: the camera stays saved (My feeds / catalog untouched).
+        self.remove_from_wall(index)
+        self.hint_lbl.setText("A feed failed to connect and was removed from the wall.")
+        self._hint_timer.start(10_000)
+
+    def open_feed_fullscreen(self, index: int) -> None:
+        """Tile "Full": this one feed in its own full-screen window. The wall tile is left alone."""
+        if self._wall is not None or self._closing or not self.pool.ready:
+            return
+        cam = self._pinned[index] if index < len(getattr(self, "_pinned", [])) else None
+        if not cam:
+            return
+        win = FeedFullscreenWindow(cam, self.pool, on_closed=self._solo_closed, parent=self)
+        self._solos.append(win)
+        win.showFullScreen()
+        win.start(300)
+
+    def _solo_closed(self, win) -> None:
+        self._solos = [w for w in self._solos if w is not win]
+
+    def close_solos(self) -> None:
+        """Close every single-feed window; each one force-stops its own player on close."""
+        solos, self._solos = list(self._solos), []
+        for win in solos:
+            try:
+                if sip.isdeleted(win):
+                    continue
+                win.on_closed = None
+                win.release()  # even if close() is refused or the window is already hidden
+                win.close()
+            except RuntimeError:
+                pass
 
     def open_library(self) -> None:
         dlg = AddCctvDialog(self)
@@ -4502,11 +5617,14 @@ class CctvPage(QWidget):
         dlg.exec()
 
     def open_fullscreen(self) -> None:
-        pinned = [cam for cam in self.cameras if cam.get("pinned")][:WALL_SLOTS]
+        slots = list(getattr(self, "_pinned", []) or [])
+        used = [i for i, cam in enumerate(slots) if cam]  # wall slots can have gaps
+        pinned = [slots[i] for i in used]
         if not pinned:
             QMessageBox.information(self, "CCTV", "Add a camera and put it on the wall first.")
             return
-        playing = [index for index in range(len(pinned)) if f"wall-{index}" in self.pool._players]
+        playing = [n for n, i in enumerate(used) if f"wall-{i}" in self.pool._players]
+        held = [i for i in used if f"wall-{i}" in self.pool._players]
         if not playing:
             QMessageBox.information(self, "CCTV", "Play a stream on the wall first.")
             return
@@ -4516,12 +5634,14 @@ class CctvPage(QWidget):
             except Exception:
                 pass
             self._wall = None
+        self.close_solos()
+        self._cancel_fail_timers()
+        self._attempts.clear()
         # Stop every main-screen stream and give VLC time to let go of the
         # video windows before the fullscreen wall reconnects them.
         self.pool.stop_all()
-        for index in playing:
-            if index < len(self.tiles):
-                self.tiles[index].show_held()
+        for index in held:
+            self.tiles[index].show_held()
         self._wall = CctvWallWindow(pinned, self.pool, on_closed=self._wall_closed, autoplay=playing)
         self._wall.show()
         self._wall.showFullScreen()
@@ -4536,6 +5656,7 @@ class CctvPage(QWidget):
             if tile.state == "empty":
                 continue
             tile.show_ready()
+        self.refresh()  # pick up any wall change made while the full-screen wall was open
         self._update_status()
 
     def shutdown(self, wait: float = 3.0) -> bool:
@@ -4553,6 +5674,12 @@ class CctvPage(QWidget):
                 tile._conn_timer.stop()
             except Exception:
                 pass
+        self.close_solos()
+        self._cancel_fail_timers()
+        try:
+            self._hint_timer.stop()
+        except Exception:
+            pass
         wall = self._wall
         self._wall = None
         if wall is not None and not sip.isdeleted(wall):
@@ -4681,13 +5808,65 @@ _AUTH_CLIENT = None
 _AUTH_INIT_ERROR = ""
 
 
+DISCORD_INVITE_URL = "https://discord.com/invite/4gRcYtTQ5c"
+
+
+def open_discord() -> None:
+    """Open the DedSec Discord invite in the default browser."""
+    from PyQt6.QtCore import QUrl
+    from PyQt6.QtGui import QDesktopServices
+    QDesktopServices.openUrl(QUrl(DISCORD_INVITE_URL))
+
+
+class CodeLineEdit(QLineEdit):
+    """Input for emailed 6-digit codes: digits only, max 6, pasted '123 456' / '123-456' is cleaned up."""
+
+    def __init__(self, placeholder: str = "6-digit code", parent=None) -> None:
+        super().__init__(parent)
+        from PyQt6.QtCore import QRegularExpression
+        from PyQt6.QtGui import QRegularExpressionValidator
+        self.setPlaceholderText(placeholder)
+        self.setMaxLength(6)
+        self.setValidator(QRegularExpressionValidator(QRegularExpression(r"\d{0,6}"), self))
+        self.setInputMethodHints(Qt.InputMethodHint.ImhDigitsOnly)
+
+    @staticmethod
+    def clean(text: str) -> str:
+        return "".join(ch for ch in (text or "") if ch.isdigit())[:6]
+
+    def code(self) -> str:
+        return self.clean(self.text())
+
+    def paste_clean(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        digits = self.clean(QApplication.clipboard().text())
+        if digits:
+            self.setText(digits)
+            self.setCursorPosition(len(digits))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        from PyQt6.QtGui import QKeySequence
+        if event.matches(QKeySequence.StandardKey.Paste):
+            self.paste_clean()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        menu = self.createStandardContextMenu()
+        for act in menu.actions():
+            if act.text().replace("&", "").lower().startswith("paste"):
+                act.triggered.disconnect()
+                act.triggered.connect(lambda _=False: self.paste_clean())
+        menu.exec(event.globalPos())
+
+
 def auth_client():
     """Shared AuthClient, created on first use. Returns None if API_BASE_URL is unusable."""
     global _AUTH_CLIENT, _AUTH_INIT_ERROR
     if _AUTH_CLIENT is None and not _AUTH_INIT_ERROR:
         try:
             _AUTH_CLIENT = AuthClient(API_BASE_URL, allow_insecure_localhost=DEDSEC_DEV,
-                                      timeout=AUTH_TIMEOUT_SECONDS)
+                                      timeout=AUTH_TIMEOUT_SECONDS, app_version=APP_VERSION)
         except Exception as exc:
             _AUTH_INIT_ERROR = f"Server address is not valid ({exc})."
     return _AUTH_CLIENT
@@ -4703,7 +5882,7 @@ class _Task(QObject):
         super().__init__()
         self._fn = fn
         self.done.connect(lambda value: self._deliver(on_ok, value))
-        self.failed.connect(lambda exc: self._deliver(on_err, exc))
+        self.failed.connect(lambda exc: self._failed(on_err, exc))
         _Task._live.add(self)
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -4714,6 +5893,13 @@ class _Task(QObject):
             self.failed.emit(exc)
         else:
             self.done.emit(value)
+
+    def _failed(self, callback, exc) -> None:
+        try:
+            self._deliver(callback, exc)
+        finally:
+            if isinstance(exc, UpdateRequiredError):  # server refuses this version: any call, anywhere
+                handle_update_required()
 
     def _deliver(self, callback, value) -> None:
         _Task._live.discard(self)
@@ -4752,6 +5938,8 @@ def _friendly_error(exc, action: str = "") -> str:
     """Turn client/network exceptions into short messages for people, not developers."""
     if isinstance(exc, DeviceLocked):
         return "This account is locked to another PC. Request a device reset."
+    if isinstance(exc, UpdateRequiredError):
+        return UPDATE_REQUIRED_MSG
     if isinstance(exc, AuthError):
         status = exc.status
         detail = str(exc)
@@ -5037,6 +6225,7 @@ class AuthScreen(QWidget):
         lay.addSpacing(2)
         lay.addWidget(self.signin_btn)
         lay.addWidget(self._link("Have a verification code? Enter it here", self._goto_verify))
+        lay.addWidget(self._link("Join our Discord", open_discord))
         lay.addStretch(1)
         return page
 
@@ -5051,6 +6240,25 @@ class AuthScreen(QWidget):
         self.su_pw2.returnPressed.connect(self._do_signup)
         for w in (self.su_email, self.su_pw, self.su_pw2):
             lay.addWidget(w)
+        # Product-update consent: unticked by default (UK PECR/GDPR). Changeable later in Settings > Account.
+        self.su_updates = QCheckBox("Email me product updates")
+        self.su_updates.setObjectName("AuthRemember")
+        self.su_updates.setChecked(False)
+        self.su_updates.setToolTip("Release notes and announcements. You can unsubscribe any time.")
+        self.su_updates.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(self.su_updates)
+        # Terms of use: required, unticked by default. The link opens the full text.
+        terms_row = QHBoxLayout()
+        terms_row.setContentsMargins(0, 0, 0, 0)
+        terms_row.setSpacing(4)
+        self.su_terms = QCheckBox("I agree to the")
+        self.su_terms.setObjectName("AuthRemember")
+        self.su_terms.setChecked(False)
+        self.su_terms.setCursor(Qt.CursorShape.PointingHandCursor)
+        terms_row.addWidget(self.su_terms)
+        terms_row.addWidget(self._link("Terms of use", lambda: show_terms(self)))
+        terms_row.addStretch(1)
+        lay.addLayout(terms_row)
         lay.addSpacing(6)
         lay.addWidget(self.signup_btn)
         lay.addStretch(1)
@@ -5059,7 +6267,8 @@ class AuthScreen(QWidget):
     def _build_verify(self) -> QWidget:
         page, lay = self._page()
         self.verify_hint = self._label("Check your email for a verification code, then paste it below.")
-        self.verify_code = self._field("Verification code from the email")
+        self.verify_code = CodeLineEdit("6-digit code")
+        self.verify_code.setObjectName("AuthField")
         self.verify_code.returnPressed.connect(self._do_verify)
         self.verify_btn = self._primary("Verify email", self._do_verify)
         self.resend_btn = self._link("Didn't get it? Resend code", self._do_resend)
@@ -5117,9 +6326,7 @@ class AuthScreen(QWidget):
         self.dev_email = self._field("Email")
         self.dev_email.setReadOnly(True)
         self.dev_request_btn = self._primary("Request device reset", self._do_device_request)
-        self.dev_code = QLineEdit()
-        self.dev_code.setPlaceholderText("000000")
-        self.dev_code.setMaxLength(6)
+        self.dev_code = CodeLineEdit("6-digit code")
         self.dev_code.setObjectName("LockCode")
         self.dev_code.returnPressed.connect(self._do_device_confirm)
         self.dev_confirm_btn = self._primary("Confirm reset", self._do_device_confirm)
@@ -5204,6 +6411,9 @@ class AuthScreen(QWidget):
         run_bg(job, ok, err)
 
     def _on_error(self, exc, action: str) -> None:
+        if isinstance(exc, UpdateRequiredError):  # the update prompt is opened by _Task
+            self._show_error(UPDATE_REQUIRED_MSG)
+            return
         device_locked = isinstance(exc, DeviceLocked) or (
             isinstance(exc, AuthError) and exc.status == 403 and "another pc" in str(exc).lower())
         if device_locked:  # hardware lock: never treat as "verify your email"
@@ -5318,6 +6528,9 @@ class AuthScreen(QWidget):
     def _restore_failed(self, exc) -> None:
         self._busy = False
         self.set_mode(self.MODE_SIGNIN)
+        if isinstance(exc, UpdateRequiredError):
+            self._show_error(UPDATE_REQUIRED_MSG)
+            return
         msg = _friendly_error(exc)
         self._show_error("Couldn't restore your session. " + msg)
 
@@ -5440,6 +6653,9 @@ class AuthScreen(QWidget):
         if pw != pw2:
             self._show_error("The passwords don't match.")
             return
+        if not self.su_terms.isChecked():
+            self._show_error("Please agree to the Terms of use to create an account.")
+            return
         client = auth_client()
 
         def ok(_msg):
@@ -5451,22 +6667,23 @@ class AuthScreen(QWidget):
             self.set_mode(self.MODE_VERIFY)
             self.verify_hint.setText(f"Check your email ({email}) for a verification code, then paste it below.")
 
-        self._run(self.signup_btn, "Creating account…", lambda: client.register(email, pw), ok, "register")
+        self._run(self.signup_btn, "Creating account…", lambda: client.register(email, pw, self.su_updates.isChecked(), terms_accepted=True), ok, "register")
 
     def _goto_verify(self) -> None:
         self.verify_hint.setText("Check your email for a verification code, then paste it below.")
         self.set_mode(self.MODE_VERIFY)
 
     def _do_verify(self) -> None:
-        token = self.verify_code.text().strip()
-        if len(token) < 10:
-            self._show_error("Paste the full code from the email.")
+        token = self.verify_code.code()
+        if len(token) != 6:
+            self._show_error("Enter the 6-digit code from the email.")
             return
         client = auth_client()
         email, pw = self._pending
+        code_email = email or self.si_email.text().strip() or None
 
         def job():
-            client.verify_email(token)
+            client.verify_email(token, code_email)
             if not (email and pw):
                 return "verified"
             try:  # sign straight in with the credentials just entered
@@ -5761,6 +6978,8 @@ class CctvApp(QWidget):
         self.lock.deleteLater()
         self.lock = None
         self.layout.addWidget(self.page)
+        page = self.page
+        QTimer.singleShot(800, lambda: page.start_vpn_check() if self.page is page else None)
 
     def _close_page(self) -> None:
         page = self.page
@@ -6062,6 +7281,131 @@ def check_for_update(base: str = UPDATE_BASE_URL, current: str = APP_VERSION, se
             pass
 
 
+# ---------------------------------------------------------------------------
+# Announcements & changelogs (Settings > Updates)
+# news.json + news.json.sig are static files next to latest.json (Caddy, /updates/), signed
+# offline with the SAME Ed25519 key as updates (tools/sign_news.py). Never the API, so the
+# minimum-version check never blocks them. Unsigned / badly signed / malformed feeds are ignored;
+# the last good copy is cached in AppData and re-verified on every load.
+# ---------------------------------------------------------------------------
+NEWS_FILE = "news.json"
+NEWS_TIMEOUT = 5.0
+NEWS_MAX_BYTES = 256 * 1024
+NEWS_MAX_ITEMS = 100
+NEWS_TYPES = ("announcement", "changelog")
+
+
+def _news_cache_paths():
+    base = _store_path().parent
+    return base / "news_cache.json", base / "news_cache.json.sig"
+
+
+def parse_news(data) -> dict | None:
+    """Validate a decoded feed -> {"generated": str, "items": [...]} with clean strings, or None."""
+    if not isinstance(data, dict) or data.get("schema") != 1 or not isinstance(data.get("items"), list):
+        return None
+    items = []
+    for raw in data["items"][:NEWS_MAX_ITEMS]:
+        if not isinstance(raw, dict):
+            continue
+        kind = str(raw.get("type") or "").strip().lower()
+        title = str(raw.get("title") or "").strip()
+        date = str(raw.get("date") or "").strip()
+        if kind not in NEWS_TYPES or not title or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            continue
+        version = str(raw.get("version") or "").strip()
+        if version and not re.fullmatch(r"\d{1,4}(\.\d{1,4}){0,3}", version):
+            version = ""
+        items.append({"id": str(raw.get("id") or "")[:80], "type": kind, "title": title[:200], "date": date,
+                      "version": version, "body": str(raw.get("body") or "")[:8000]})
+    items.sort(key=lambda it: it["date"], reverse=True)
+    return {"generated": str(data.get("generated") or "")[:40], "items": items}
+
+
+def _decode_news(raw: bytes, sig, public_key=None):
+    if not raw or len(raw) > NEWS_MAX_BYTES or not verify_manifest_signature(raw, sig, public_key):
+        return None
+    try:
+        return parse_news(json.loads(raw.decode("utf-8-sig")))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def load_cached_news(public_key=None):
+    path, sig_path = _news_cache_paths()
+    try:
+        return _decode_news(path.read_bytes(), sig_path.read_bytes(), public_key)
+    except OSError:
+        return None
+
+
+def fetch_news(base: str = UPDATE_BASE_URL, session=None, public_key=None):
+    """Download + verify the feed (short timeout). Returns (feed, from_cache: bool) or (None, True).
+    A verified download replaces the cache unless it is older than the cached copy (no rollback)."""
+    cached = load_cached_news(public_key)
+    if urlparse(base).scheme != "https":
+        return (cached, True)
+    s = session or _update_session()
+    def get(name: str, limit: int):
+        r = s.get(urljoin(base, name), timeout=NEWS_TIMEOUT, allow_redirects=False, stream=True)
+        try:
+            if r.status_code != 200:
+                return None
+            body = r.raw.read(limit + 1, decode_content=True) if getattr(r, "raw", None) else r.content
+            return body if len(body) <= limit else None
+        finally:
+            r.close()
+    try:
+        raw = get(NEWS_FILE, NEWS_MAX_BYTES)
+        sig = get(NEWS_FILE + UPDATE_SIG_SUFFIX, 1024) if raw else None
+    except Exception:
+        return (cached, True)
+    if not raw or not sig:
+        return (cached, True)
+    feed = _decode_news(raw, sig, public_key)
+    if feed is None:
+        return (cached, True)
+    if cached is not None and feed["generated"] < cached["generated"]:
+        return (cached, True)  # never roll back to an older signed feed
+    path, sig_path = _news_cache_paths()
+    try:
+        path.write_bytes(raw)
+        sig_path.write_bytes(sig)
+    except OSError:
+        pass
+    return (feed, False)
+
+
+def news_body_html(text: str) -> str:
+    """Tiny, safe markdown subset -> Qt rich text. Everything is HTML-escaped first, so remote
+    content can never inject tags, images or links; supports '# ' headings, '- ' / '* ' bullets,
+    **bold** and `code`. URLs stay plain text (not clickable)."""
+    import html as _html
+    out, in_list = [], False
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        esc = _html.escape(line.strip(), quote=True)
+        esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+        esc = re.sub(r"`([^`]+)`", r'<span style="font-family:Consolas,monospace;color:#7ee0ff">\1</span>', esc)
+        bullet = re.match(r"^[-*]\s+(.*)$", esc)
+        if bullet:
+            if not in_list:
+                out.append('<ul style="margin-top:2px;margin-bottom:2px;-qt-list-indent:1">')
+                in_list = True
+            out.append(f"<li>{bullet.group(1)}</li>")
+            continue
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+        head = re.match(r"^#{1,3}\s+(.*)$", esc)
+        if head:
+            out.append(f'<p style="margin-top:6px;margin-bottom:2px"><b style="color:#ffffff">{head.group(1)}</b></p>')
+        elif esc:
+            out.append(f'<p style="margin-top:2px;margin-bottom:2px">{esc}</p>')
+    if in_list:
+        out.append("</ul>")
+    return "".join(out)
+
+
 def sha256_file(path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -6132,7 +7476,11 @@ def updater_command(zip_path, sha256: str, pid: int | None = None, workdir=None)
     script = target / UPDATER_SCRIPT_NAME
     pid = os.getpid() if pid is None else pid
     if _is_compiled():
-        launch = [str(Path(sys.executable).resolve())]
+        # Nuitka's sys.executable can be python.exe; relaunch the real app exe
+        cand = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else None
+        if not (cand and cand.suffix.lower() == ".exe" and cand.is_file() and cand.parent == target):
+            cand = target / "DedSecCCTV.exe"
+        launch = [str(cand)]
     else:
         launch = [str(Path(__file__).resolve())]
     if exe.is_file() and sys.platform == "win32":
@@ -6238,8 +7586,14 @@ class UpdateDialog(QDialog):
         self.quit_btn.setObjectName("AuthLink")
         self.quit_btn.clicked.connect(lambda: os._exit(0))
         self.quit_btn.setVisible(info.mandatory)
+        self.web_btn = QPushButton("Download page")
+        self.web_btn.setObjectName("AuthLink")
+        self.web_btn.setToolTip(GITHUB_RELEASES_URL)
+        self.web_btn.clicked.connect(lambda: open_url(GITHUB_RELEASES_URL))
+        self.web_btn.setVisible(info.mandatory)
         row.addWidget(self.later_btn)
         row.addWidget(self.quit_btn)
+        row.addWidget(self.web_btn)
         row.addStretch(1)
         lay.addWidget(title)
         lay.addWidget(msg)
@@ -6346,7 +7700,87 @@ def start_update_check(parent=None) -> None:
     run_bg(check_for_update, show, lambda _exc: None)
 
 
+UPDATE_REQUIRED_MSG = "This version of DedSec CCTV is out of date. Please update to keep using the app."
+_UPDATE_REQUIRED_ACTIVE = False
+
+
+def _show_update_dialog(info, parent=None) -> None:
+    global _UPDATE_DIALOG
+    if _UPDATE_DIALOG is None:
+        _UPDATE_DIALOG = UpdateDialog(info, parent)
+    _UPDATE_DIALOG.show()
+    _UPDATE_DIALOG.raise_()
+    _UPDATE_DIALOG.activateWindow()
+
+
+def _update_required_fallback(parent=None) -> None:
+    """No installable update could be fetched: point at the GitHub releases page, then quit."""
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle("DedSec CCTV update required")
+    box.setText(UPDATE_REQUIRED_MSG)
+    box.setInformativeText("The update couldn't be downloaded automatically. Get the latest version from "
+                           "the DedSec CCTV releases page, then install it.")
+    open_btn = box.addButton("Open releases page", QMessageBox.ButtonRole.AcceptRole)
+    box.addButton("Quit", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(open_btn)
+    box.exec()
+    if box.clickedButton() is open_btn:
+        open_url(GITHUB_RELEASES_URL)
+    _quit_for_update()
+
+
+def handle_update_required(parent=None) -> None:
+    """The server rejected this version (HTTP 426): run the update check and force the update.
+
+    Shows the mandatory update dialog if a newer signed release is available, otherwise the
+    releases-page fallback (then quits). Safe to call repeatedly; only one prompt is shown.
+    """
+    global _UPDATE_REQUIRED_ACTIVE
+    if _UPDATE_DIALOG is not None and (_UPDATE_DIALOG.info.mandatory or _UPDATE_DIALOG.isVisible()):
+        dlg = _UPDATE_DIALOG  # start-up check already found the update: make it non-dismissable
+        dlg.info.mandatory = True
+        dlg.later_btn.setVisible(False)
+        dlg.quit_btn.setVisible(True)
+        dlg.web_btn.setVisible(True)
+        _show_update_dialog(dlg.info)
+        return
+    if _UPDATE_REQUIRED_ACTIVE:
+        return
+    _UPDATE_REQUIRED_ACTIVE = True
+    if parent is None:
+        app = QApplication.instance()
+        parent = app.activeWindow() if app is not None else None
+
+    def found(info) -> None:
+        global _UPDATE_DIALOG
+        if info is None:
+            _update_required_fallback(parent)
+            return
+        info.mandatory = True
+        _UPDATE_DIALOG = None  # replace any earlier, dismissed optional prompt
+        _show_update_dialog(info, parent)
+
+    run_bg(check_for_update, found, lambda _exc: _update_required_fallback(parent))
+
+
+_INSTANCE_MUTEX = None
+
+
+def _create_instance_mutex() -> None:
+    """Named mutex so the installer (AppMutex) can tell the app is running. Harmless elsewhere."""
+    global _INSTANCE_MUTEX
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        _INSTANCE_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "DedSecCCTV_SingleInstance")
+    except Exception:
+        _INSTANCE_MUTEX = None
+
+
 def main():
+    _create_instance_mutex()
     app = QApplication(sys.argv)
     _ensure_vlc(app)
     app.setStyle("Fusion")

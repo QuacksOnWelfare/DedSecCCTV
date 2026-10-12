@@ -1,7 +1,7 @@
 """Live smoke test against the deployed server over HTTPS (no -k / full TLS verification).
 
 Reads the verification code from the server's journal over SSH (EMAIL_BACKEND=console).
-    python tests/smoke_remote.py https://auth.example.com deploy@auth.example.com ~/.ssh/id_ed25519
+    python tests/smoke_remote.py https://auth.example.com user@auth.example.com ~/.ssh/id_ed25519
 Prints the test email on the last line so it can be deleted from the live DB afterwards.
 """
 from __future__ import annotations

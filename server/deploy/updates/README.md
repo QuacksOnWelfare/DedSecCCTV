@@ -52,3 +52,22 @@ curl -s https://<domain>/updates/latest.json
 ```
 Dot-files are hidden and directory listing is off (see Caddyfile.example).
 Withdraw: delete `latest.json`. Roll back: republish old code with a **higher** version.
+
+## Announcements / changelogs (`news.json`)
+
+The desktop app Settings → Updates panel fetches `news.json` (+ `news.json.sig`)
+from the same `/updates/` folder. Both files are Ed25519-signed with the **same
+key pair** as `latest.json` (see `app/tools/sign_news.py` and
+`docs/UPDATE_SIGNING.md`).
+
+```
+/var/www/dedsec-cctv-updates/
+├── latest.json
+├── latest.json.sig
+├── news.json
+├── news.json.sig
+└── DedSecCCTV.zip
+```
+
+Publish by copying the signed pair into this directory (sig first, then json; mode 0644).
+Body markdown is limited (headings, bullets, bold, code); remote HTML/images are never rendered.

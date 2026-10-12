@@ -15,6 +15,7 @@ from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user
 from ..emailer import get_sender, send_device_reset_email, send_verification_email
+from ..minversion import require_app_version
 from ..models import EmailVerificationToken, LoginChallenge, RefreshToken, User
 from ..ratelimit import TOO_MANY, client_ip, limit_account, limit_ip, limiter
 from ..schemas import (
@@ -25,11 +26,11 @@ from ..schemas import (
 from ..security import (
     as_aware, constant_time_eq, create_access_token, decode_access_token, decrypt_secret, encrypt_secret,
     generate_totp_secret, hash_hwid, hash_password, hash_reset_code, hash_token, needs_rehash,
-    new_opaque_token, new_reset_code, normalize_b32, password_problems, provisioning_uri, utcnow,
+    new_opaque_token, new_reset_code, new_numeric_code, normalize_code, hash_verify_code, normalize_b32, password_problems, provisioning_uri, utcnow,
     verify_password, verify_totp,
 )
 
-router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(limit_ip)])
+router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(limit_ip), Depends(require_app_version)])
 
 GENERIC_LOGIN_ERROR = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
 INVALID_TOKEN = HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired token.")
@@ -64,11 +65,11 @@ def _issue_verification(db: Session, user: User) -> None:
     db.execute(update(EmailVerificationToken)
                .where(EmailVerificationToken.user_id == user.id, EmailVerificationToken.used.is_(False))
                .values(used=True))  # only the newest token is valid
-    token = new_opaque_token()
-    db.add(EmailVerificationToken(user_id=user.id, token_hash=hash_token(token),
+    code = new_numeric_code()
+    db.add(EmailVerificationToken(user_id=user.id, token_hash=hash_verify_code(user.id, code), attempts=0,
                                   expires_at=utcnow() + timedelta(hours=s.email_verification_ttl_hours)))
     db.commit()
-    send_verification_email(user.email, token)
+    send_verification_email(user.email, code, s.email_verification_ttl_hours * 60)
 
 
 def _issue_tokens(db: Session, user: User, request: Request, family_id: str | None = None) -> TokenOut:
@@ -148,7 +149,48 @@ def _register_failure(db: Session, user: User) -> None:
     db.commit()
 
 
-def _verify_email_token(db: Session, token: str) -> None:
+_CODE_RE = re.compile(r"^\d{6}$")
+
+
+def _verify_email_code(db: Session, code: str, email: str | None) -> None:
+    """6-digit code: single-use, keyed hash, max attempts per code (LOGIN_CHALLENGE_MAX_ATTEMPTS)."""
+    s = get_settings()
+    now = utcnow()
+    q = select(EmailVerificationToken).where(EmailVerificationToken.used.is_(False))
+    if email:
+        e = _norm_email(email)
+        limit_account(f"verify:{e}")
+        user = db.scalar(select(User).where(User.email == e))
+        if user is None:
+            raise INVALID_TOKEN
+        q = q.where(EmailVerificationToken.user_id == user.id)
+    else:
+        # Clients older than 1.0.2 send only the code. Global cap keeps blind guessing impractical.
+        if not limiter.hit("verify-code-noemail", 300, 3600):
+            raise TOO_MANY
+    rows = [r for r in db.scalars(q) if as_aware(r.expires_at) > now]  # type: ignore[operator]
+    for row in rows:
+        if constant_time_eq(row.token_hash, hash_verify_code(row.user_id, code)):
+            row.used = True
+            user = db.get(User, row.user_id)
+            if user is None:
+                raise INVALID_TOKEN
+            user.email_verified = True
+            db.commit()
+            return
+    if email:
+        for row in rows:  # count the wrong guess against this account's pending code
+            row.attempts = (row.attempts or 0) + 1
+            if row.attempts >= s.login_challenge_max_attempts:
+                row.used = True  # burned: request a new code
+        db.commit()
+    raise INVALID_TOKEN
+
+
+def _verify_email_token(db: Session, token: str, email: str | None = None) -> None:
+    code = normalize_code(token)
+    if _CODE_RE.match(code):
+        return _verify_email_code(db, code, email)
     row = db.scalar(select(EmailVerificationToken).where(EmailVerificationToken.token_hash == hash_token(token)))
     if row is None or row.used or as_aware(row.expires_at) <= utcnow():  # type: ignore[operator]
         raise INVALID_TOKEN
@@ -174,7 +216,14 @@ def register(body: RegisterIn, db: Session = Depends(get_db)) -> MessageOut:
     pw_hash = hash_password(body.password)  # always hash -> uniform timing
     existing = db.scalar(select(User).where(User.email == email))
     if existing is None:
-        user = User(email=email, password_hash=pw_hash)
+        user = User(id=str(uuid.uuid4()), email=email, password_hash=pw_hash, email_updates=bool(body.email_updates),
+                    email_updates_changed_at=utcnow() if body.email_updates else None,
+                    terms_accepted_at=utcnow() if body.terms_accepted else None)
+        from ..email_prefs import ensure_token
+        try:
+            ensure_token(user)
+        except RuntimeError:
+            pass
         db.add(user)
         db.commit()
         _issue_verification(db, user)
@@ -192,7 +241,7 @@ def register(body: RegisterIn, db: Session = Depends(get_db)) -> MessageOut:
 
 @router.post("/verify-email", response_model=MessageOut)
 def verify_email(body: VerifyEmailIn, db: Session = Depends(get_db)) -> MessageOut:
-    _verify_email_token(db, body.token)
+    _verify_email_token(db, body.token, body.email)
     return MessageOut(message="Email verified. You can now log in.")
 
 
@@ -432,7 +481,7 @@ def device_reset_confirm(body: DeviceResetConfirmIn, request: Request, db: Sessi
     email = _norm_email(body.email)
     limit_account(f"devreset:{email}")
     new_hwid = _request_hwid(request, body.new_hwid)
-    code = body.code.strip().replace(" ", "")
+    code = normalize_code(body.code)
     user = db.scalar(select(User).where(User.email == email))
     if (user is None or not user.is_active or new_hwid is None
             or user.device_reset_code_hash is None or user.device_reset_expires is None):

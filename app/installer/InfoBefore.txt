@@ -1,0 +1,9 @@
+Before you start
+
+DedSec CCTV shows public camera streams that are already available on the open internet. It is not a tool for accessing private or secured cameras.
+
+You need a DedSec Lab account to sign in. Create one from the app's sign-in screen or through the community Discord if you do not have access yet.
+
+A VPN is recommended while you browse public streams. Your own network still sees the traffic unless you use one.
+
+By continuing you agree to use the software only for lawful purposes and only with streams you are allowed to view.

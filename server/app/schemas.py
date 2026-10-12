@@ -15,10 +15,14 @@ class _Strict(BaseModel):
 class RegisterIn(_Strict):
     email: EmailStr
     password: str = Field(min_length=1, max_length=256)
+    email_updates: bool = False  # sign-up opt-in for product-update emails (unticked by default)
+    terms_accepted: bool = False  # new clients require the tick; optional so older clients keep working
 
 
 class VerifyEmailIn(_Strict):
-    token: str = Field(min_length=10, max_length=200)
+    # 6-digit code (new) or a legacy long token from emails sent before the switch.
+    token: str = Field(min_length=6, max_length=200)
+    email: EmailStr | None = None  # recommended with 6-digit codes (per-account lookup + attempt limit)
 
 
 # Client device id: SHA-256 hex of machine identifiers, truncated (the raw ids never leave the PC).

@@ -5,6 +5,7 @@ import logging
 import smtplib
 import ssl
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid, parseaddr
 from typing import Protocol
 
 from .config import get_settings
@@ -13,12 +14,12 @@ log = logging.getLogger("dedsec_auth.email")
 
 
 class EmailSender(Protocol):
-    def send(self, to: str, subject: str, body: str) -> None: ...
+    def send(self, to: str, subject: str, body: str, html_body: str | None = None) -> str | None: ...
 
 
 class ConsoleSender:
     """Development: print the email to the server log. NEVER use in production."""
-    def send(self, to: str, subject: str, body: str) -> None:
+    def send(self, to: str, subject: str, body: str, html_body: str | None = None) -> None:
         log.warning("[DEV EMAIL] to=%s subject=%s\n%s", to, subject, body)
         print(f"\n===== DEV EMAIL to {to} =====\nSubject: {subject}\n\n{body}\n=============================\n")
 
@@ -28,32 +29,50 @@ class MemorySender:
     def __init__(self) -> None:
         self.outbox: list[tuple[str, str, str]] = []
 
-    def send(self, to: str, subject: str, body: str) -> None:
+    def send(self, to: str, subject: str, body: str, html_body: str | None = None) -> None:
         self.outbox.append((to, subject, body))
 
 
 class SmtpSender:
-    def send(self, to: str, subject: str, body: str) -> None:
+    def send(self, to: str, subject: str, body: str, html_body: str | None = None) -> str:
+        """Send; returns the server's reply to DATA (Brevo: 'OK: queued as <id>')."""
         s = get_settings()
         msg = EmailMessage()
         msg["From"], msg["To"], msg["Subject"] = s.smtp_from, to, subject
+        msg["Date"] = formatdate(usegmt=True)
+        domain = (s.smtp_from.rsplit("@", 1)[-1].strip(" >") or "localhost")
+        msg["Message-ID"] = make_msgid(idstring="acct", domain=domain)
+        if s.support_email:
+            msg["Reply-To"] = s.support_email
+        msg["Auto-Submitted"] = "auto-generated"
         msg.set_content(body)
+        if html_body:
+            msg.add_alternative(html_body, subtype="html")
         ctx = ssl.create_default_context()
         if s.smtp_ssl:
             with smtplib.SMTP_SSL(s.smtp_host, s.smtp_port, context=ctx, timeout=15) as smtp:
-                self._login_send(smtp, msg)
-        else:
-            with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=15) as smtp:
-                if s.smtp_starttls:
-                    smtp.starttls(context=ctx)
-                self._login_send(smtp, msg)
+                return self._login_send(smtp, msg)
+        with smtplib.SMTP(s.smtp_host, s.smtp_port, timeout=15) as smtp:
+            if s.smtp_starttls:
+                smtp.starttls(context=ctx)
+            return self._login_send(smtp, msg)
 
     @staticmethod
-    def _login_send(smtp: smtplib.SMTP, msg: EmailMessage) -> None:
+    def _login_send(smtp: smtplib.SMTP, msg: EmailMessage) -> str:
         s = get_settings()
         if s.smtp_username:
             smtp.login(s.smtp_username, s.smtp_password)
-        smtp.send_message(msg)
+        frm, to = parseaddr(msg["From"])[1], parseaddr(msg["To"])[1]
+        code, _ = smtp.mail(frm)
+        if code != 250:
+            raise smtplib.SMTPSenderRefused(code, b"", frm)
+        code, _ = smtp.rcpt(to)
+        if code not in (250, 251):
+            raise smtplib.SMTPRecipientsRefused({to: (code, b"")})
+        code, resp = smtp.data(msg.as_bytes())
+        if code != 250:
+            raise smtplib.SMTPDataError(code, resp)
+        return resp.decode(errors="replace")
 
 
 _sender: EmailSender | None = None
@@ -67,33 +86,20 @@ def get_sender() -> EmailSender:
     return _sender
 
 
-def send_verification_email(to: str, token: str) -> None:
-    s = get_settings()
-    link = f"{s.public_base_url.rstrip('/')}/auth/verify-email?token={token}"
-    body = (
-        "Welcome to DedSec CCTV.\n\n"
-        f"Confirm your email address with this link (valid {s.email_verification_ttl_hours}h):\n{link}\n\n"
-        f"Or paste this code into the app: {token}\n\n"
-        "If you didn't create an account, ignore this email."
-    )
+def send_verification_email(to: str, code: str, ttl_minutes: int | None = None) -> None:
+    from .email_templates import render
+    ttl = ttl_minutes or get_settings().email_verification_ttl_hours * 60
+    subject, _pre, html_body, text = render("verify", code, ttl)
     try:
-        get_sender().send(to, "Verify your DedSec CCTV account", body)
+        get_sender().send(to, subject, text, html_body=html_body)
     except Exception:  # never leak SMTP errors to the client (or reveal account existence)
         log.exception("failed to send verification email")
 
 
 def send_device_reset_email(to: str, code: str, ttl_minutes: int) -> None:
-    body = (
-        "DedSec CCTV - device reset\n\n"
-        "Someone (hopefully you) asked to move your DedSec CCTV account to a new PC.\n\n"
-        f"Your reset code: {code}\n\n"
-        f"Enter it in the app within {ttl_minutes} minutes. After the reset the account works only on\n"
-        "the new PC and every other session is signed out.\n\n"
-        "If this wasn't you, ignore this email and change your password. Your account stays\n"
-        "locked to your current PC.\n\n"
-        "- DedSec CCTV"
-    )
+    from .email_templates import render
+    subject, _pre, html_body, text = render("device_reset", code, ttl_minutes)
     try:
-        get_sender().send(to, "DedSec CCTV device reset code", body)
+        get_sender().send(to, subject, text, html_body=html_body)
     except Exception:  # never leak SMTP errors to the client
         log.exception("failed to send device reset email")

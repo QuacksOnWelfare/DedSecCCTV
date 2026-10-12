@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     smtp_username: str = ""
     smtp_password: str = ""
     smtp_from: str = "DedSec CCTV <no-reply@example.com>"
+
+    # --- product-update emails: HMAC key for unsubscribe tokens (>= 32 random bytes) ---
+    email_unsub_key: str = ""
+    # --- branding used in transactional emails (self-hosters: set these) ---
+    email_asset_base: str = "https://auth.example.com/updates/email/"
+    support_email: str = "support@example.com"
+    discord_url: str = ""
+    github_url: str = "https://github.com/QuacksOnWelfare/DedSecCCTV"
+
+    # --- minimum desktop-app version (empty = no minimum; see app/minversion.py) ---
+    min_app_version: str = ""
     smtp_starttls: bool = True
     smtp_ssl: bool = False
 

@@ -77,9 +77,11 @@ Settings: About and updates
 DedSec CCTV is a Windows desktop app (PyQt6 + libVLC) for viewing live camera streams, plus the FastAPI
 authentication server behind it. Sign-up is free and accounts are protected with two-step verification.
 
-The **official app** ships with DedSec Lab's curated catalog of **1,309 live feeds across 23 countries**, and more
+The **official app** ships with DedSec Lab's curated catalog of **1,507 live feeds across 26 countries**, and more
 countries and feeds will come in future updates. The **complete source code** is in this repository too, so you
 can see exactly what the app does, build it yourself, or run the whole stack on your own server.
+
+Current release: **1.0.2**. Builds from this repository ship only the `user_streams/` templates, not the official catalog.
 
 ## Community / Support
 
@@ -152,6 +154,12 @@ Once installed, the app updates itself. See [Updates & roadmap](#updates--roadma
 > <!-- Add images to docs/screenshots/ and reference them here, e.g.
 > ![Camera wall](docs/screenshots/wall.png) -->
 
+
+- Multi-camera wall with stable tiles (no flash on remove), failed-feed retry, and full-screen per feed
+- Custom RTSP/HTTP feeds (My feeds) and stream search by id, name, city, country, host
+- Settings → Updates: signed announcements and changelogs (same Ed25519 key as app updates)
+- Min-version gate, VPN-exit block list, terms acceptance, Discord link, product-update email preference
+
 ## Two ways to use DedSec CCTV
 
 | | **Official app** | **Build & self-host** |
@@ -159,7 +167,7 @@ Once installed, the app updates itself. See [Updates & roadmap](#updates--roadma
 | **Who it's for** | Anyone who just wants to watch | Developers, tinkerers, people who want full control |
 | **How to get it** | Prebuilt `.exe` from [GitHub Releases][releases] | Build from this repository |
 | **Account server** | DedSec Lab's official servers | Your own server (`server/`) |
-| **Stream catalog** | DedSec Lab's curated catalog: **1,309 feeds, 23 countries**, growing | **No catalog included.** Add your own in `user_streams/` |
+| **Stream catalog** | DedSec Lab's curated catalog: **1,507 feeds, 26 countries**, growing | **No catalog included.** Add your own in `user_streams/` |
 | **Your own cameras** | ✅ via *My streams* | ✅ via *My streams* |
 | **Updates** | Automatic, via the in-app updater | You publish your own releases to your own update URL |
 | **Cost** | Free | Free (you pay for your own hosting) |

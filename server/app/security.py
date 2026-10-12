@@ -117,6 +117,21 @@ def new_reset_code() -> str:
     return f"{secrets.randbelow(10**6):06d}"
 
 
+def new_numeric_code() -> str:
+    """6-digit numeric one-time code from the CSPRNG."""
+    return f"{secrets.randbelow(10**6):06d}"
+
+
+def normalize_code(code: str) -> str:
+    """Accept pasted codes like '123 456' or '123-456'."""
+    return code.strip().replace(" ", "").replace("-", "")
+
+
+def hash_verify_code(user_id: str, code: str) -> str:
+    key = get_settings().jwt_secret.encode()
+    return hmac.new(key, f"verify-email:{user_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
 def hash_reset_code(user_id: str, code: str) -> str:
     """Keyed hash: a 6-digit code is trivially brute-forced from a plain SHA-256 if the DB leaks."""
     key = get_settings().jwt_secret.encode()

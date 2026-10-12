@@ -12,6 +12,8 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from .config import get_settings
 from .db import init_db
 from .routes.auth import router as auth_router
+from .routes.email_prefs import router as email_prefs_router
+from .routes.net import router as net_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -71,6 +73,8 @@ def create_app() -> FastAPI:
         app.add_middleware(HTTPSRedirectMiddleware)
 
     app.include_router(auth_router)
+    app.include_router(email_prefs_router)
+    app.include_router(net_router)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

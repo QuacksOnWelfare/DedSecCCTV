@@ -49,6 +49,16 @@ class User(Base):
     device_reset_new_hwid_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     device_reset_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
 
+    # product-update emails (UK PECR/GDPR): explicit opt-in, default off. The unsubscribe token is
+    # HMAC(EMAIL_UNSUB_KEY, id:nonce); only its SHA-256 is stored. Rotate by changing the nonce.
+    email_updates: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=False)
+    email_updates_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    email_unsub_nonce: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    email_unsub_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    # Terms of use: set at register when the client sent terms_accepted=true (nullable for old rows).
+    terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     @property
     def device_bound(self) -> bool:
         return self.device_hwid_hash is not None
@@ -64,6 +74,7 @@ class EmailVerificationToken(Base):
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    attempts: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)  # wrong 6-digit guesses
 
 
 class RefreshToken(Base):

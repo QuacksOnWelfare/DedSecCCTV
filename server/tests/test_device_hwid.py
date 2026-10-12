@@ -29,7 +29,7 @@ def _login(client: TestClient, email: str, headers: dict | None = None, **extra)
 def _reset_code(outbox: MemorySender, email: str) -> str:
     mails = [m for m in outbox.outbox if m[0] == email and "device reset" in m[1].lower()]
     assert mails, "no device reset email"
-    m = re.search(r"Your reset code: (\d{6})", mails[-1][2])
+    m = re.search(r"Your code: (\d{6})", mails[-1][2])
     assert m
     return m.group(1)
 
@@ -132,7 +132,7 @@ def test_device_reset_flow(client: TestClient, outbox: MemorySender) -> None:
     r = client.post("/auth/device/reset-request", json={"email": email, "password": PASSWORD, "new_hwid": PC_B})
     assert r.status_code == 202
     mail = [m for m in outbox.outbox if m[0] == email][-1]
-    assert mail[1] == "DedSec CCTV device reset code" and "15 minutes" in mail[2]
+    assert mail[1].startswith("Your DedSec CCTV device reset code:") and "15 minutes" in mail[2]
     code = _reset_code(outbox, email)
     u = _user(email)
     assert u.device_reset_code_hash and code not in u.device_reset_code_hash
