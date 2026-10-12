@@ -22,7 +22,11 @@ auth.example.com {
 	}
 
 	handle {
-		reverse_proxy 127.0.0.1:8000
+		reverse_proxy 127.0.0.1:8000 {
+			# Overwrite (never append to) X-Forwarded-For with the client IP Caddy resolved, so a
+			# client-supplied X-Forwarded-For can't spoof the per-IP rate limit or /net/check.
+			header_up X-Forwarded-For {client_ip}
+		}
 	}
 
 	header -Server

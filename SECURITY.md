@@ -51,6 +51,8 @@ To qualify for a reward:
 - Testing must have been done only against your own account or a self-hosted copy.
 - The issue must be in scope and you must have followed the rules on this page.
 - It must be the first valid report of that issue. Duplicates are not rewarded.
+- It must work against the latest release. Issues that only affect older versions or older source code are not eligible.
+- Issues we have already found, are already working on, or have already fixed are not eligible, even if they haven't been announced yet.
 
 ### Severity tiers
 

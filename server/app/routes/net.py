@@ -1,8 +1,8 @@
 """GET /net/check: does the caller's connection look like a VPN/datacenter or a home ISP?
 
 No auth. Rate-limited by the shared per-IP limiter. The client IP comes from client_ip(),
-which on this deployment is the CF-Connecting-IP value that Caddy verifies and writes into
-X-Forwarded-For. The IP is never returned, never logged here, and only kept in an in-memory
+which behind your own reverse proxy (TRUST_PROXY_HEADERS=true) is the client IP the proxy
+writes into X-Forwarded-For (see deploy/Caddyfile.example). The IP is never returned, never logged here, and only kept in an in-memory
 1-hour cache (keyed by a salted hash) so repeat checks don't hit the upstream lookup.
 """
 from __future__ import annotations

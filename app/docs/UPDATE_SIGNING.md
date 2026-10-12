@@ -33,9 +33,9 @@ This writes `latest.json` and `latest.json.sig` next to the zip. Add `--optional
 Do not edit `latest.json` after signing, or the signature breaks and the app ignores the update.
 
 ## 5. Publish to the VPS
-    scp -P YOUR_SSH_PORT -i %USERPROFILE%\.ssh\YOUR_KEY DedSecCCTV.zip latest.json latest.json.sig YOUR_USER@YOUR_SERVER_IP:/tmp/rel/
-    ssh -p YOUR_SSH_PORT -i %USERPROFILE%\.ssh\YOUR_KEY YOUR_USER@YOUR_SERVER_IP "cd /tmp/rel && sudo install -m 0644 DedSecCCTV.zip latest.json.sig latest.json /var/www/dedsec-cctv-updates/ && rm -rf /tmp/rel"
-(Create the folder first with `ssh ... "mkdir -p /tmp/rel"`.)
+    scp -P YOUR_SSH_PORT -i %USERPROFILE%\.ssh\YOUR_KEY DedSecCCTV.zip latest.json latest.json.sig YOUR_USER@YOUR_SERVER_IP:YOUR_STAGING_DIR/
+    ssh -p YOUR_SSH_PORT -i %USERPROFILE%\.ssh\YOUR_KEY YOUR_USER@YOUR_SERVER_IP "cd YOUR_STAGING_DIR && sudo install -m 0644 DedSecCCTV.zip latest.json.sig latest.json /var/www/dedsec-cctv-updates/ && rm -rf YOUR_STAGING_DIR"
+(Create the folder first with `ssh ... "mkdir -p YOUR_STAGING_DIR"`.)
 Install the zip first, then the .sig, then latest.json last.
 Keep the update folder root-owned and read-only for the web server user, so the web server can read it but not change it.
 

@@ -114,6 +114,12 @@ _log = logging.getLogger(__name__)
 def check_production_safety(s: Settings) -> None:
     """Refuse to start in production while any setting still contains a CHANGE_ME placeholder."""
     bad = [name for name, val in s.model_dump().items() if PLACEHOLDER_MARK.lower() in str(val).lower()]
+    # A placeholder JWT/TOTP secret is never acceptable outside the test suite: anyone who
+    # read .env.example could forge tokens if the operator forgot ENVIRONMENT=production.
+    weak = [n for n in ("jwt_secret", "totp_encryption_key")
+            if PLACEHOLDER_MARK.lower() in str(getattr(s, n)).lower()]
+    if weak and s.environment != "test":
+        raise RuntimeError("Refusing to start; replace the CHANGE_ME placeholder in: " + ", ".join(weak))
     if s.environment == "production":
         if s.email_backend != "smtp":
             bad.append("email_backend (must be 'smtp' in production)")
