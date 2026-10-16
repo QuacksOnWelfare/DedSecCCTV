@@ -103,3 +103,31 @@ def send_device_reset_email(to: str, code: str, ttl_minutes: int) -> None:
         get_sender().send(to, subject, text, html_body=html_body)
     except Exception:  # never leak SMTP errors to the client
         log.exception("failed to send device reset email")
+
+
+def send_code_email(kind: str, to: str, code: str, ttl_minutes: int) -> None:
+    """Password-reset / email-2FA codes (kinds in email_templates.KINDS). Never raises."""
+    from .email_templates import render
+    try:
+        subject, _pre, html_body, text = render(kind, code, ttl_minutes)
+        get_sender().send(to, subject, text, html_body=html_body)
+    except Exception:  # never leak SMTP errors to the client (or reveal account existence)
+        log.exception("failed to send %s email", kind)
+
+
+def send_reset_link_email(to: str, url: str, ttl_minutes: int) -> None:
+    from .email_templates import render_reset_link
+    try:
+        subject, _pre, html_body, text = render_reset_link(url, ttl_minutes)
+        get_sender().send(to, subject, text, html_body=html_body)
+    except Exception:
+        log.exception("failed to send password reset link email")
+
+
+def send_password_changed_email(to: str) -> None:
+    from .email_templates import render_password_changed
+    try:
+        subject, _pre, html_body, text = render_password_changed()
+        get_sender().send(to, subject, text, html_body=html_body)
+    except Exception:
+        log.exception("failed to send password changed email")

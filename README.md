@@ -77,11 +77,11 @@ Settings: About and updates
 DedSec CCTV is a Windows desktop app (PyQt6 + libVLC) for viewing live camera streams, plus the FastAPI
 authentication server behind it. Sign-up is free and accounts are protected with two-step verification.
 
-The **official app** ships with DedSec Lab's curated catalog of **1,507 live feeds across 26 countries**, and more
+The **official app** ships with DedSec Lab's curated catalog of **4,245 live feeds across 32 countries**, and more
 countries and feeds will come in future updates. The **complete source code** is in this repository too, so you
 can see exactly what the app does, build it yourself, or run the whole stack on your own server.
 
-Current release: **1.0.2**. Builds from this repository ship only the `user_streams/` templates, not the official catalog.
+Current release: **1.0.3**. Builds from this repository ship only the `user_streams/` templates, not the official catalog.
 
 ## Community / Support
 
@@ -167,7 +167,7 @@ Once installed, the app updates itself. See [Updates & roadmap](#updates--roadma
 | **Who it's for** | Anyone who just wants to watch | Developers, tinkerers, people who want full control |
 | **How to get it** | Prebuilt `.exe` from [GitHub Releases][releases] | Build from this repository |
 | **Account server** | DedSec Lab's official servers | Your own server (`server/`) |
-| **Stream catalog** | DedSec Lab's curated catalog: **1,507 feeds, 26 countries**, growing | **No catalog included.** Add your own in `user_streams/` |
+| **Stream catalog** | DedSec Lab's curated catalog: **4,245 feeds, 32 countries**, growing | **No catalog included.** Add your own in `user_streams/` |
 | **Your own cameras** | ✅ via *My streams* | ✅ via *My streams* |
 | **Updates** | Automatic, via the in-app updater | You publish your own releases to your own update URL |
 | **Cost** | Free | Free (you pay for your own hosting) |
@@ -267,10 +267,22 @@ See [app/user_streams/README.txt](app/user_streams/README.txt) for details.
 
 ## Updates & roadmap
 
+### 1.0.3
+- **Forgot password**: reset it with a 6-digit code sent to your email
+- **Email codes for 2FA**: choose email codes or an authenticator app after your first sign-in, and change it any time in Settings > Account
+- **Change email** option on the sign-up code screen
+- **Sound level meter** on feeds
+- New **update window** with download progress, plus an updater that shows its progress and an "Update complete" screen
+- **32 countries, 4,245 streams**. New: Australia, India, Ukraine, Israel, South Korea, Russia
+- The updater is now built into the app and no longer sits in the install folder
+- Resize cursor getting stuck in full screen
+- Security bug fixes
+
+### Ongoing
 - **Official releases** are published on **[GitHub Releases][releases]**, and existing installs pick them up
   automatically through the **in-app updater**.
 - **More countries and more live feeds** are planned for the official catalog in future updates, building on today's
-  1,309 feeds across 23 countries.
+  4,245 feeds across 32 countries.
 - The open-source code in this repository is updated alongside the releases.
 - Self-hosters publish their own updates: bump `APP_VERSION`, build, and upload the release plus `latest.json`
   as described in [server/deploy/updates/README.md](server/deploy/updates/README.md).

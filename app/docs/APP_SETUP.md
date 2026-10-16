@@ -71,9 +71,11 @@ copies `config.ini` (if you created one) and the `user_streams\` template next t
 No stream catalog is packed. The first build downloads a C compiler (MinGW64) or uses MSVC — answer "yes".
 Ship the whole `DedSecCCTV\` folder.
 
-Updater (needed for auto-update), once per release, placed next to the exe:
+Since 1.0.3, `build.py` also builds the updater and bundles it inside the app as
+`DedSecCCTV\assets\updater\DedSecUpdater.bin` (no separate copy in the install root). Rebuild just the
+updater with menu option 13, or:
 ```bat
-venv\Scripts\python -m nuitka --onefile --windows-console-mode=disable --output-filename=DedSecUpdater.exe updater.py
+venv\Scripts\python -m nuitka --onefile --windows-console-mode=disable --enable-plugin=tk-inter --output-filename=DedSecUpdater.exe updater.py
 ```
 
 ## 6. Publishing updates

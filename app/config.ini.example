@@ -7,3 +7,5 @@ api_url = https://auth.example.com
 update_url = https://auth.example.com/updates/
 ; Optional comma-separated public IPs that may not use the app (e.g. VPN exits). Empty = none.
 blocked_ips =
+; Optional: Ed25519 public key (base64) that signs latest.json. Same as UPDATE_PUBLIC_KEY_B64 in app.py.
+; update_public_key = PASTE_ED25519_PUBLIC_KEY_HERE

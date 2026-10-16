@@ -1,12 +1,21 @@
 ; DedSec CCTV - Inno Setup 6 installer (modern wizard)
 ; Build with:  powershell -File installer\build_installer.ps1
-; Or:          ISCC.exe /DAppVersion=1.0.2 installer\DedSecCCTV.iss
+; Or:          ISCC.exe installer\DedSecCCTV.iss   (version read from the built exe)
+; Or:          ISCC.exe /DAppVersion=1.0.3 installer\DedSecCCTV.iss
 ;
 ; Expects a Nuitka standalone folder next to installer\:
-;   ..\DedSecCCTV\DedSecCCTV.exe  (+ DedSecUpdater.exe recommended)
+;   ..\DedSecCCTV\DedSecCCTV.exe  (updater bundled as assets\updater\DedSecUpdater.bin)
+;
+; Version: /DAppVersion wins; otherwise the ProductVersion that build.py stamps into
+; DedSecCCTV.exe from APP_VERSION; otherwise version.inc (written by build_installer.ps1).
 
 #ifndef AppVersion
-  #include "version.inc"
+  #define ExeProductVersion GetStringFileInfo(AddBackslash(SourcePath) + "..\DedSecCCTV\DedSecCCTV.exe", "ProductVersion")
+  #if ExeProductVersion != ""
+    #define AppVersion ExeProductVersion
+  #else
+    #include "version.inc"
+  #endif
 #endif
 
 #define MyAppName       "DedSec CCTV"
@@ -110,7 +119,7 @@ NewerAlreadyInstalled=A newer version of DedSec CCTV (%1) is already installed. 
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
-; Entire Nuitka standalone dist (exe, DLLs, assets, optional DedSecUpdater.exe).
+; Entire Nuitka standalone dist (exe, DLLs, assets incl. assets\updater\DedSecUpdater.bin).
 Source: "..\DedSecCCTV\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -121,10 +130,15 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent; WorkingDir: "{app}"
 
+[InstallDelete]
+; 1.0.2 and older shipped the updater in the install root; it now lives in assets\updater.
+Type: files; Name: "{app}\DedSecUpdater.exe"
+
 [UninstallDelete]
 ; Leftover files created at runtime next to the exe (never touch AppData here).
 Type: filesandordirs; Name: "{app}\user_streams"
 Type: files; Name: "{app}\*.log"
+Type: filesandordirs; Name: "{app}\.dedsec-update-backup"
 
 [Code]
 const

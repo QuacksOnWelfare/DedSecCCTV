@@ -60,6 +60,18 @@ class Settings(BaseSettings):
     discord_url: str = ""
     github_url: str = "https://github.com/QuacksOnWelfare/DedSecCCTV"
 
+    # --- password reset (email code -> emailed single-use link) ---
+    password_reset_code_ttl_minutes: int = 10   # lifetime of the 6-digit code entered in the app
+    password_reset_link_ttl_minutes: int = 15   # lifetime of the emailed reset link
+    password_reset_max_attempts: int = 5        # wrong codes before the pending reset is burned
+    password_reset_emails_per_hour: int = 3     # code emails per account
+    password_reset_requests_per_hour: int = 5   # forgot-password requests per email address (sent or not)
+
+    # --- email two-factor (alternative to the authenticator app) ---
+    email_2fa_code_ttl_minutes: int = 10
+    email_2fa_max_attempts: int = 5
+    email_2fa_emails_per_hour: int = 5          # per account, sign-in + settings codes together
+
     # --- minimum desktop-app version (empty = no minimum; see app/minversion.py) ---
     min_app_version: str = ""
     smtp_starttls: bool = True

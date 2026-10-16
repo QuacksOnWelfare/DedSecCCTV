@@ -20,7 +20,7 @@ def _email() -> str:
 
 def _token_from(outbox: MemorySender, email: str) -> str:
     body = [m for m in outbox.outbox if m[0] == email][-1][2]
-    m = re.search(r"Your code: (\S+)", body)
+    m = re.search(r"Your code: (\d{6})", body)
     assert m
     return m.group(1)
 

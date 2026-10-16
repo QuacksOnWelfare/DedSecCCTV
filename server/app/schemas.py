@@ -54,6 +54,32 @@ class DeviceResetConfirmIn(_Strict):
     new_hwid: str | None = Field(default=None, pattern=HWID_PATTERN)  # or header X-Device-Id
 
 
+class ForgotPasswordIn(_Strict):
+    email: EmailStr
+
+
+class ResetCodeIn(_Strict):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=10)
+
+
+class EmailCodeResendIn(_Strict):
+    challenge_token: str = Field(min_length=10, max_length=200)
+
+
+class Email2FASendIn(_Strict):
+    purpose: Literal["enable", "disable"]
+
+
+class Email2FAEnableIn(_Strict):
+    code: str = Field(min_length=6, max_length=10)
+    totp_code: str | None = Field(default=None, min_length=6, max_length=10)  # required while the app 2FA is on
+
+
+class Email2FADisableIn(_Strict):
+    code: str = Field(min_length=6, max_length=10)
+
+
 class RefreshIn(_Strict):
     refresh_token: str = Field(min_length=10, max_length=200)
 
@@ -87,9 +113,10 @@ class TokenOut(BaseModel):
 
 
 class ChallengeOut(BaseModel):
-    status: Literal["totp_required"] = "totp_required"
+    status: Literal["totp_required"] = "totp_required"  # kept for every 2FA kind (older clients parse it)
     challenge_token: str
     expires_in: int
+    method: Literal["totp", "email"] = "totp"
 
 
 class TwoFASetupOut(BaseModel):
@@ -106,8 +133,15 @@ class UserOut(BaseModel):
     email: EmailStr
     email_verified: bool
     totp_enabled: bool
+    email_2fa_enabled: bool = False
+    twofa_method: Literal["none", "totp", "email"] = "none"
     device_bound: bool = False
     created_at: datetime
+
+    @field_validator("email_2fa_enabled", mode="before")
+    @classmethod
+    def _null_false(cls, v: object) -> bool:
+        return bool(v)
 
     @field_validator("created_at")
     @classmethod

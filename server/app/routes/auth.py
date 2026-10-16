@@ -14,18 +14,18 @@ from sqlalchemy.orm import Session
 from ..config import get_settings
 from ..db import get_db
 from ..deps import current_user
-from ..emailer import get_sender, send_device_reset_email, send_verification_email
+from ..emailer import get_sender, send_code_email, send_device_reset_email, send_verification_email
 from ..minversion import require_app_version
 from ..models import EmailVerificationToken, LoginChallenge, RefreshToken, User
 from ..ratelimit import TOO_MANY, client_ip, limit_account, limit_ip, limiter
 from ..schemas import (
-    HWID_PATTERN, ChallengeOut, DeviceResetConfirmIn, DeviceResetRequestIn, LoginIn, LogoutIn, MessageOut,
-    RefreshIn, RegisterIn, TokenOut, TotpLoginIn, TwoFAEnableIn, TwoFASetupIn, TwoFASetupOut, UserOut,
-    VerifyEmailIn,
+    HWID_PATTERN, ChallengeOut, DeviceResetConfirmIn, DeviceResetRequestIn, Email2FADisableIn, Email2FAEnableIn,
+    Email2FASendIn, EmailCodeResendIn, LoginIn, LogoutIn, MessageOut, RefreshIn, RegisterIn, TokenOut, TotpLoginIn,
+    TwoFAEnableIn, TwoFASetupIn, TwoFASetupOut, UserOut, VerifyEmailIn,
 )
 from ..security import (
     as_aware, constant_time_eq, create_access_token, decode_access_token, decrypt_secret, encrypt_secret,
-    generate_totp_secret, hash_hwid, hash_password, hash_reset_code, hash_token, needs_rehash,
+    generate_totp_secret, hash_hwid, hash_password, hash_purpose_code, hash_reset_code, hash_token, needs_rehash,
     new_opaque_token, new_reset_code, new_numeric_code, normalize_code, hash_verify_code, normalize_b32, password_problems, provisioning_uri, utcnow,
     verify_password, verify_totp,
 )
@@ -280,17 +280,23 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)) -> Tok
     if not user.email_verified:  # only disclosed to someone who knows the password
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email address not verified.")
     hwid = _request_hwid(request, body.hwid)
-    if user.totp_enabled:
-        # fail early (before a TOTP code is spent); binding itself happens after the 2FA step
+    if user.totp_enabled or user.email_2fa_enabled:
+        # fail early (before a code is spent / emailed); binding itself happens after the 2FA step
         if hwid is None and _hwid_required(user):
             raise DEVICE_ID_REQUIRED
         if _device_mismatch(user, hwid):
             raise DEVICE_MISMATCH
         token = new_opaque_token()
-        db.add(LoginChallenge(user_id=user.id, token_hash=hash_token(token),
-                              expires_at=utcnow() + timedelta(seconds=s.login_challenge_ttl_seconds)))
-        db.commit()
-        return ChallengeOut(challenge_token=token, expires_in=s.login_challenge_ttl_seconds)
+        if user.totp_enabled:  # the authenticator app wins if both are somehow set
+            db.add(LoginChallenge(user_id=user.id, token_hash=hash_token(token), method="totp",
+                                  expires_at=utcnow() + timedelta(seconds=s.login_challenge_ttl_seconds)))
+            db.commit()
+            return ChallengeOut(challenge_token=token, expires_in=s.login_challenge_ttl_seconds, method="totp")
+        ttl = s.email_2fa_code_ttl_minutes * 60
+        ch = LoginChallenge(user_id=user.id, token_hash=hash_token(token), method="email", resends=0,
+                            expires_at=utcnow() + timedelta(seconds=ttl))
+        _email_login_code(db, user, ch)
+        return ChallengeOut(challenge_token=token, expires_in=ttl, method="email")
     _device_gate(db, user, hwid)
     return _issue_tokens(db, user, request)
 
@@ -302,24 +308,76 @@ def login_totp(body: TotpLoginIn, request: Request, db: Session = Depends(get_db
     if ch is None or ch.used or as_aware(ch.expires_at) <= utcnow():  # type: ignore[operator]
         raise INVALID_CODE
     user = db.get(User, ch.user_id)
-    if user is None or not user.is_active or not user.totp_enabled or user.totp_secret_enc is None:
+    if user is None or not user.is_active:
+        raise INVALID_CODE
+    by_email = ch.method == "email"
+    if by_email:
+        if not user.email_2fa_enabled or not ch.code_hash:
+            raise INVALID_CODE
+    elif not user.totp_enabled or user.totp_secret_enc is None:
         raise INVALID_CODE
     limit_account(user.email)
     if _is_locked(user):
         raise INVALID_CODE
     ch.attempts += 1
-    step = verify_totp(decrypt_secret(user.totp_secret_enc), body.code, user.totp_last_step)
-    if step is None:
-        if ch.attempts >= s.login_challenge_max_attempts:
+    max_attempts = s.email_2fa_max_attempts if by_email else s.login_challenge_max_attempts
+    if by_email:
+        code = normalize_code(body.code)
+        ok = bool(_CODE_RE.match(code)) and constant_time_eq(ch.code_hash or "", _login_code_hash(ch, code))
+        step = None
+    else:
+        step = verify_totp(decrypt_secret(user.totp_secret_enc), body.code, user.totp_last_step)
+        ok = step is not None
+    if not ok:
+        if ch.attempts >= max_attempts:
             ch.used = True  # burn the challenge; user must re-enter the password
         _register_failure(db, user)
         raise INVALID_CODE
     ch.used = True
-    user.totp_last_step = step
+    if step is not None:
+        user.totp_last_step = step
     user.failed_login_count = 0
     db.commit()
     _device_gate(db, user, _request_hwid(request, body.hwid))
     return _issue_tokens(db, user, request)
+
+
+def _login_code_hash(ch: LoginChallenge, code: str) -> str:
+    return hash_purpose_code("login-email", ch.token_hash, code)
+
+
+def _email_2fa_quota(user: User) -> None:
+    """Per-account cap on 2FA emails (sign-in and settings codes together)."""
+    if not limiter.hit(f"email2fa-mail:{user.id}", get_settings().email_2fa_emails_per_hour, 3600):
+        raise TOO_MANY
+
+
+def _email_login_code(db: Session, user: User, ch: LoginChallenge) -> None:
+    """(Re)issue the emailed sign-in code of an email-2FA challenge and send it."""
+    _email_2fa_quota(user)
+    code = new_numeric_code()
+    if ch.id is None:
+        db.add(ch)
+    ch.code_hash = _login_code_hash(ch, code)
+    db.commit()
+    send_code_email("login_code", user.email, code, get_settings().email_2fa_code_ttl_minutes)
+
+
+@router.post("/login/email-code", response_model=MessageOut)
+def resend_login_code(body: EmailCodeResendIn, db: Session = Depends(get_db)) -> MessageOut:
+    """Email 2FA: send a fresh sign-in code for a pending challenge (max 3 resends, rate-limited)."""
+    ch = db.scalar(select(LoginChallenge).where(LoginChallenge.token_hash == hash_token(body.challenge_token)))
+    if ch is None or ch.used or ch.method != "email" or as_aware(ch.expires_at) <= utcnow():  # type: ignore[operator]
+        raise INVALID_CODE
+    user = db.get(User, ch.user_id)
+    if user is None or not user.is_active or not user.email_2fa_enabled:
+        raise INVALID_CODE
+    if (ch.resends or 0) >= 3:
+        raise TOO_MANY
+    ch.resends = (ch.resends or 0) + 1
+    ch.expires_at = utcnow() + timedelta(minutes=get_settings().email_2fa_code_ttl_minutes)
+    _email_login_code(db, user, ch)
+    return MessageOut(message="A new code is on its way.")
 
 
 # ---------------------------------------------------------------------------
@@ -359,11 +417,93 @@ def twofa_enable(body: TwoFAEnableIn, user: User = Depends(current_user), db: Se
     user.totp_secret_enc = user.totp_pending_secret_enc
     user.totp_pending_secret_enc = None
     user.totp_enabled = True
+    user.email_2fa_enabled = False  # one 2FA method at a time: the authenticator app replaces email codes
     user.totp_last_step = step
     user.token_version += 1  # security-relevant change: kill other sessions' access tokens
     db.execute(update(RefreshToken).where(RefreshToken.user_id == user.id).values(revoked=True))
     db.commit()
     return MessageOut(message="Two-factor authentication enabled. Please log in again.")
+
+
+_EMAIL_OTP_PURPOSES = ("enable", "disable")
+
+
+def _check_email_otp(db: Session, user: User, purpose: str, code: str) -> None:
+    """Settings code (enable / disable email 2FA): single-use, expiring, attempt-limited."""
+    s = get_settings()
+    limit_account(f"email2fa:{user.id}")
+    code = normalize_code(code)
+    if (user.email_otp_hash is None or user.email_otp_purpose != purpose or user.email_otp_expires is None
+            or as_aware(user.email_otp_expires) <= utcnow()):  # type: ignore[operator]
+        raise INVALID_CODE
+    if not (_CODE_RE.match(code) and constant_time_eq(user.email_otp_hash,
+                                                       hash_purpose_code(f"email-2fa-{purpose}", user.id, code))):
+        user.email_otp_attempts = (user.email_otp_attempts or 0) + 1
+        if user.email_otp_attempts >= s.email_2fa_max_attempts:
+            user.email_otp_hash = user.email_otp_expires = user.email_otp_purpose = None  # burned
+        db.commit()
+        raise INVALID_CODE
+    user.email_otp_hash = user.email_otp_expires = user.email_otp_purpose = None
+    user.email_otp_attempts = 0
+
+
+def _end_all_sessions(db: Session, user: User) -> None:
+    user.token_version += 1
+    db.execute(update(RefreshToken).where(RefreshToken.user_id == user.id).values(revoked=True))
+
+
+@router.post("/2fa/email/send", response_model=MessageOut, status_code=status.HTTP_202_ACCEPTED)
+def email_2fa_send(body: Email2FASendIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> MessageOut:
+    """Email a code that confirms turning email 2FA on or off."""
+    s = get_settings()
+    if body.purpose == "enable" and user.email_2fa_enabled:
+        raise HTTPException(status_code=409, detail="Email codes are already your two-factor method.")
+    if body.purpose == "disable" and not user.email_2fa_enabled:
+        raise HTTPException(status_code=409, detail="Email codes are not your two-factor method.")
+    _email_2fa_quota(user)
+    code = new_numeric_code()
+    user.email_otp_hash = hash_purpose_code(f"email-2fa-{body.purpose}", user.id, code)
+    user.email_otp_purpose = body.purpose
+    user.email_otp_expires = utcnow() + timedelta(minutes=s.email_2fa_code_ttl_minutes)
+    user.email_otp_attempts = 0
+    db.commit()
+    send_code_email("twofa_settings", user.email, code, s.email_2fa_code_ttl_minutes)
+    return MessageOut(message="A 6-digit code is on its way to your email.")
+
+
+@router.post("/2fa/email/enable", response_model=MessageOut)
+def email_2fa_enable(body: Email2FAEnableIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> MessageOut:
+    """Make email codes the 2FA method. Switching from the authenticator app also needs a current app code."""
+    if user.email_2fa_enabled:
+        raise HTTPException(status_code=409, detail="Email codes are already your two-factor method.")
+    if user.totp_enabled:
+        limit_account(f"2fa:{user.id}")
+        step = None
+        if body.totp_code and user.totp_secret_enc is not None:
+            step = verify_totp(decrypt_secret(user.totp_secret_enc), body.totp_code, user.totp_last_step)
+        if step is None:
+            raise HTTPException(status_code=401, detail="Enter the current code from your authenticator app.",
+                                headers={"X-Error-Code": "totp_required"})
+        user.totp_last_step = step
+    _check_email_otp(db, user, "enable", body.code)
+    user.email_2fa_enabled = True
+    user.totp_enabled = False
+    user.totp_secret_enc = None
+    user.totp_pending_secret_enc = None
+    _end_all_sessions(db, user)
+    db.commit()
+    return MessageOut(message="Email codes are now your two-factor method. Please log in again.")
+
+
+@router.post("/2fa/email/disable", response_model=MessageOut)
+def email_2fa_disable(body: Email2FADisableIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> MessageOut:
+    if not user.email_2fa_enabled:
+        raise HTTPException(status_code=409, detail="Email codes are not your two-factor method.")
+    _check_email_otp(db, user, "disable", body.code)
+    user.email_2fa_enabled = False
+    _end_all_sessions(db, user)
+    db.commit()
+    return MessageOut(message="Two-factor authentication is off. Please log in again.")
 
 
 # ---------------------------------------------------------------------------

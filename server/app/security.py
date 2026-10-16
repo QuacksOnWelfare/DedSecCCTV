@@ -138,6 +138,12 @@ def hash_reset_code(user_id: str, code: str) -> str:
     return hmac.new(key, f"device-reset:{user_id}:{code}".encode(), hashlib.sha256).hexdigest()
 
 
+def hash_purpose_code(purpose: str, scope: str, code: str) -> str:
+    """Keyed hash for short emailed codes (password reset, email 2FA). ``scope`` binds it to a user/challenge."""
+    key = get_settings().jwt_secret.encode()
+    return hmac.new(key, f"{purpose}:{scope}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
 def constant_time_eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode(), b.encode())
 
@@ -183,7 +189,7 @@ def decode_access_token(token: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# TOTP — identical scheme to the desktop app: RFC 6238, HMAC-SHA1, 30 s, 6 digits, ±1 step
+# TOTP -- identical scheme to the desktop app: RFC 6238, HMAC-SHA1, 30 s, 6 digits, ±1 step
 # ---------------------------------------------------------------------------
 
 TOTP_STEP = 30

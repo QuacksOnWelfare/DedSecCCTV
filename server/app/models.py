@@ -59,9 +59,23 @@ class User(Base):
     # Terms of use: set at register when the client sent terms_accepted=true (nullable for old rows).
     terms_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Email two-factor (1.0.3): sign-in codes go to the account email instead of an authenticator app.
+    # email_otp_* hold the one pending settings code (enable / disable email 2FA); only a keyed hash is stored.
+    email_2fa_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=False)
+    email_otp_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email_otp_expires: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    email_otp_attempts: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    email_otp_purpose: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     @property
     def device_bound(self) -> bool:
         return self.device_hwid_hash is not None
+
+    @property
+    def twofa_method(self) -> str:
+        if self.totp_enabled:
+            return "totp"
+        return "email" if self.email_2fa_enabled else "none"
 
     refresh_tokens: Mapped[list[RefreshToken]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
@@ -104,3 +118,26 @@ class LoginChallenge(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 1.0.3: "totp" (NULL for old rows) or "email"; for email challenges the keyed hash of the emailed code
+    method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resends: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+
+
+class PasswordReset(Base):
+    """Forgot password: 6-digit emailed code (entered in the app) -> emailed single-use reset link.
+
+    Only keyed / SHA-256 hashes are stored. One live row per user: a new request burns older ones.
+    """
+    __tablename__ = "password_resets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    code_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    code_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    link_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)  # burned / superseded / password already set

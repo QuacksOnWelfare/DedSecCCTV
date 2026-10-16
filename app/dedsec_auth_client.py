@@ -98,7 +98,7 @@ LOGIN_KEYRING_SERVICE = "DedSecCCTV-login"  # "Remember me" credentials (OS stor
 
 # Sent on every request so the server can refuse versions older than its MIN_APP_VERSION.
 APP_VERSION_HEADER = "X-DedSec-App-Version"
-APP_VERSION = "1.0.2"  # default only; app.py passes its own APP_VERSION to AuthClient(app_version=...)
+APP_VERSION = "1.0.3"  # default only; app.py passes its own APP_VERSION to AuthClient(app_version=...)
 UPDATE_REQUIRED_STATUS = 426
 UPDATE_REQUIRED_MSG = "This version of DedSec CCTV is out of date. Please update to keep using the app."
 _VERSION_HEADER_RE = re.compile(r"^[0-9A-Za-z.+-]{1,32}$")
@@ -124,7 +124,15 @@ class UpdateRequiredError(AuthError):
 
 
 class TotpRequired(AuthError):
-    """Raised by ``login()`` when the account has 2FA; call ``submit_totp(code)`` next."""
+    """Raised by ``login()`` when the account has 2FA; call ``submit_totp(code)`` next.
+
+    ``method`` is ``"totp"`` (authenticator app) or ``"email"`` (code emailed to the account address;
+    ``resend_login_code()`` sends a fresh one).
+    """
+
+    def __init__(self, message: str, status: int = 200, method: str = "totp") -> None:
+        super().__init__(message, status)
+        self.method = method
 
 
 class DeviceLocked(AuthError):
@@ -142,6 +150,12 @@ class User:
     totp_enabled: bool
     created_at: str
     device_bound: bool = False
+    email_2fa_enabled: bool = False
+    twofa_method: str = "none"  # "none" | "totp" | "email"
+
+    @property
+    def has_2fa(self) -> bool:
+        return self.totp_enabled or self.email_2fa_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +595,7 @@ class AuthClient:
         self._access_exp: float = 0.0
         self._refresh: str | None = None
         self._challenge: str | None = None
+        self._challenge_method = "totp"
         # str, or a callable returning it (computed lazily on the worker thread; default hardware_id)
         self._device_id = device_id if device_id is not None else hardware_id
 
@@ -670,6 +685,7 @@ class AuthClient:
 
     def _clear_session(self) -> None:
         self._access, self._access_exp, self._refresh, self._challenge = None, 0.0, None, None
+        self._challenge_method = "totp"
         self._store.clear()
 
     # -- public API --------------------------------------------------------
@@ -714,7 +730,10 @@ class AuthClient:
             data = r.json()
             if data.get("status") == "totp_required":
                 self._challenge = data["challenge_token"]
-                raise TotpRequired("Enter the 6-digit code from your authenticator app.", 200)
+                self._challenge_method = "email" if data.get("method") == "email" else "totp"
+                if self._challenge_method == "email":
+                    raise TotpRequired("Enter the 6-digit code we emailed you.", 200, "email")
+                raise TotpRequired("Enter the 6-digit code from your authenticator app.", 200, "totp")
             self._accept_tokens(data)
         return self.current_user()
 
@@ -727,6 +746,29 @@ class AuthClient:
             self._raise_for(r)
             self._accept_tokens(r.json())
         return self.current_user()
+
+    def resend_login_code(self) -> str:
+        """Email 2FA: ask for a fresh sign-in code for the pending challenge."""
+        with self._lock:
+            if not self._challenge or self._challenge_method != "email":
+                raise AuthError("No pending sign-in code; log in again.")
+            r = self._post("/auth/login/email-code", {"challenge_token": self._challenge})
+            self._raise_for(r)
+            return str(r.json().get("message", ""))
+
+    # -- forgot password ---------------------------------------------------
+    def forgot_password(self, email: str) -> str:
+        """Step 1: the server emails a 6-digit code if the account exists (same answer either way)."""
+        r = self._post("/auth/password/forgot", {"email": email.strip()})
+        self._raise_for(r)
+        return str(r.json().get("message", ""))
+
+    def verify_reset_code(self, email: str, code: str) -> str:
+        """Step 2: a correct code makes the server email a single-use password reset link."""
+        code = "".join(ch for ch in code if ch.isdigit())
+        r = self._post("/auth/password/verify-code", {"email": email.strip(), "code": code})
+        self._raise_for(r)
+        return str(r.json().get("message", ""))
 
     def try_resume(self, raise_network_errors: bool = False) -> bool:
         """Silently restore a session from the stored refresh token. Returns True on success.
@@ -757,7 +799,8 @@ class AuthClient:
         self._raise_for(r)
         d = r.json()
         return User(d["id"], d["email"], d["email_verified"], d["totp_enabled"], d["created_at"],
-                    bool(d.get("device_bound", False)))
+                    bool(d.get("device_bound", False)), bool(d.get("email_2fa_enabled", False)),
+                    str(d.get("twofa_method") or ("totp" if d["totp_enabled"] else "none")))
 
     # -- hardware lock: move the account to this PC ------------------------
     def request_device_reset(self, email: str, password: str) -> str:
@@ -785,6 +828,31 @@ class AuthClient:
     def enable_2fa(self, code: str) -> None:
         """Confirm enrolment with a first code. The server then ends all sessions: log in again."""
         r = self._post("/auth/2fa/enable", {"code": code.strip()}, auth=True)
+        self._raise_for(r)
+        self._clear_session()
+
+    # -- email two-factor ----------------------------------------------------
+    def send_email_2fa_code(self, purpose: str) -> str:
+        """Email a code confirming ``purpose`` ("enable" or "disable") of email 2FA."""
+        if purpose not in ("enable", "disable"):
+            raise ValueError("purpose must be 'enable' or 'disable'")
+        r = self._post("/auth/2fa/email/send", {"purpose": purpose}, auth=True)
+        self._raise_for(r)
+        return str(r.json().get("message", ""))
+
+    def enable_email_2fa(self, code: str, totp_code: str | None = None) -> None:
+        """Make email codes the 2FA method (``totp_code`` is needed while the authenticator is on).
+        The server then ends all sessions: log in again."""
+        body: dict[str, Any] = {"code": "".join(ch for ch in code if ch.isdigit())}
+        if totp_code:
+            body["totp_code"] = "".join(ch for ch in totp_code if ch.isdigit())
+        r = self._post("/auth/2fa/email/enable", body, auth=True)
+        self._raise_for(r)
+        self._clear_session()
+
+    def disable_email_2fa(self, code: str) -> None:
+        """Turn email 2FA off. The server then ends all sessions: log in again."""
+        r = self._post("/auth/2fa/email/disable", {"code": "".join(ch for ch in code if ch.isdigit())}, auth=True)
         self._raise_for(r)
         self._clear_session()
 

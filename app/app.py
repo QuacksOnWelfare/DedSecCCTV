@@ -23,13 +23,13 @@ from PyQt6.QtCore import (Qt, QTimer, QObject, pyqtSignal, QEventLoop, QRectF, Q
                           QPropertyAnimation, QEasingCurve, pyqtProperty)
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QPixmap, QPainter, QColor, QIcon, QPalette, QImage, QLinearGradient, QPen, QPainterPath,
-    QKeySequence, QShortcut,
+    QKeySequence, QShortcut, QCursor,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFrame, QDialog, QLineEdit, QComboBox, QCheckBox,
     QListWidget, QListWidgetItem, QMessageBox, QSizePolicy, QStackedWidget, QMenu, QProgressBar,
-    QScrollArea, QFileDialog,
+    QScrollArea, QFileDialog, QTextBrowser,
 )
 
 from dedsec_auth_client import AuthClient, AuthError, DeviceLocked, SavedLogin, TotpRequired, UpdateRequiredError
@@ -310,9 +310,9 @@ def save_setting(key: str, value) -> None:
 
 
 # ---------------------------------------------------------------------------
-# App version (semver). Bump it for every release you publish; see docs/APP_SETUP.md and server/deploy/updates/README.md.
+# App version (semver). Bump it for every release you publish; see UPDATES.md.
 # ---------------------------------------------------------------------------
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 # Auto-update: static files served by Caddy on the same VPS (never the API). Only HTTPS, and only
 # files under this folder are ever downloaded; the zip's SHA-256 must match latest.json.
 def _load_app_config() -> dict:
@@ -365,6 +365,10 @@ UPDATE_CHECK_TIMEOUT = 8.0
 UPDATE_MAX_BYTES = 1024 * 1024 * 1024  # refuse anything bigger than 1 GiB
 UPDATER_EXE_NAME = "DedSecUpdater.exe"
 UPDATER_SCRIPT_NAME = "updater.py"
+# 1.0.3+: the updater ships inside the app (not in the install root) and is copied to %TEMP% as
+# DedSecUpdater.exe only while an update runs. 1.0.2 and older kept it at <install>\DedSecUpdater.exe.
+UPDATER_BUNDLED = ("assets", "updater", "DedSecUpdater.bin")
+INNO_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{E4B9A653-DDE6-59D4-959B-D211C8E5E91F}_is1"
 # Ed25519 public key (base64, 32 raw bytes) that signs latest.json. Generate your own keypair offline
 # with tools/sign_update.py keygen; set it here or as update_public_key in config.ini [server].
 # While it is the placeholder, every update is rejected (see docs/UPDATE_SIGNING.md).
@@ -832,7 +836,7 @@ def _camera_banner_path(cam) -> Path | None:
         path = Path(value.strip())
         if _usable_image(path):
             return path
-        # Relative path that was saved as-is: try streams/<country>/…
+        # Relative path that was saved as-is: try streams/<country>/...
         country = str(cam.get("country") or "")
         if country and not path.is_absolute():
             found = _stream_banner_path(country, {"banner": value.strip()})
@@ -1490,12 +1494,12 @@ def lookup_isp(url: str) -> dict:
     code = (data.get("countryCode") or "").upper()
     lines = [
         f"Host: {host}",
-        f"IP: {data.get('query') or '—'}",
-        f"Country: {data.get('country') or '—'}",
-        f"ISP: {data.get('isp') or '—'}",
-        f"Org: {data.get('org') or '—'}",
-        f"ASN: {data.get('as') or '—'}",
-        f"Location: {', '.join(p for p in (data.get('city'), data.get('regionName'), data.get('country')) if p) or '—'}",
+        f"IP: {data.get('query') or '--'}",
+        f"Country: {data.get('country') or '--'}",
+        f"ISP: {data.get('isp') or '--'}",
+        f"Org: {data.get('org') or '--'}",
+        f"ASN: {data.get('as') or '--'}",
+        f"Location: {', '.join(p for p in (data.get('city'), data.get('regionName'), data.get('country')) if p) or '--'}",
     ]
     return {"text": "\n".join(lines), "code": code}
 
@@ -2330,6 +2334,295 @@ class _TileCover(QLabel):
         p.end()
 
 
+# ---------------------------------------------------------------------------
+# Sound-level meter on the main-wall tiles (next to Mute)
+#
+# Cost is kept low: one 120 ms timer on CctvPage that only runs while at least one wall feed is
+# live and unmuted; each tick reads one float from Windows' peak meter and a few counters from
+# libvlc. The meter repaints only when its value changes.
+
+class AudioLevelMeter(QWidget):
+    """Five small bars that rise with the sound level. Hidden when muted or silent."""
+
+    BARS = 5
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(22, 16)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setToolTip("Sound level")
+        self._level = 0.0  # 0..1, already smoothed
+        self._lit = -1
+
+    def set_level(self, level: float) -> None:
+        level = max(0.0, min(1.0, float(level)))
+        # fast attack, slower release: reads like a real VU meter
+        self._level = level if level > self._level else self._level * 0.6 + level * 0.4
+        lit = int(round(self._level * self.BARS))
+        if lit != self._lit:
+            self._lit = lit
+            self.update()
+
+    def reset(self) -> None:
+        self._level = 0.0
+        self._lit = -1
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(Qt.PenStyle.NoPen)
+        w, h, n = self.width(), self.height(), self.BARS
+        gap = 1.5
+        bw = (w - gap * (n - 1)) / n
+        lit = max(1, self._lit)
+        for i in range(n):
+            bh = h * (0.35 + 0.65 * (i + 1) / n)
+            x = i * (bw + gap)
+            if i < lit:
+                col = QColor("#7dffb0") if i < 3 else (QColor("#fcd34d") if i < 4 else QColor("#ff8a95"))
+            else:
+                col = QColor(80, 110, 135, 110)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(x, h - bh, bw, bh), 1.0, 1.0)
+        p.end()
+
+
+class _ProcessAudioPeak:
+    """Peak level (0..1) of this process's audio sessions, via Windows Core Audio
+    (IAudioSessionManager2 -> IAudioMeterInformation) and ctypes; no extra dependency.
+
+    Windows mixes all of the app's VLC players into this process's session(s), so the value is for
+    the whole app, not one feed; CctvPage combines it with each player's own audio-buffer counter.
+    ``peak()`` returns None when Core Audio isn't usable (not Windows, no device, any COM error)."""
+
+    _CLSID_MMDeviceEnumerator = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+    _IID_IMMDeviceEnumerator = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+    _IID_IAudioSessionManager2 = "{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}"
+    _IID_IAudioSessionControl2 = "{BFB7FF88-7239-4FC9-8FA2-07C950BE9C6D}"
+    _IID_IAudioMeterInformation = "{C02216F6-8C67-4B5B-9D00-D008E73E0064}"
+    REFRESH_S = 3.0
+
+    def __init__(self):
+        self._ok = sys.platform.startswith("win")
+        self._meters: list = []  # IAudioMeterInformation pointers of our own sessions
+        self._next_refresh = 0.0
+        self._fails = 0
+        if self._ok:
+            try:
+                import ctypes
+                self._ct = ctypes
+                ole32 = ctypes.windll.ole32
+                ole32.CoInitializeEx(None, 2)  # STA, same as Qt's GUI thread; "already" is fine
+                self._ole32 = ole32
+            except Exception:
+                self._ok = False
+
+    # -- tiny COM helpers ----------------------------------------------------------
+    def _guid(self, text: str):
+        ct = self._ct
+
+        class GUID(ct.Structure):
+            _fields_ = [("d1", ct.c_ulong), ("d2", ct.c_ushort), ("d3", ct.c_ushort), ("d4", ct.c_ubyte * 8)]
+
+        g = GUID()
+        if self._ole32.CLSIDFromString(ct.c_wchar_p(text), ct.byref(g)) != 0:
+            raise OSError("bad guid")
+        return g
+
+    def _call(self, ptr, index: int, *args, argtypes=()):
+        ct = self._ct
+        vtbl = ct.cast(ct.cast(ptr, ct.POINTER(ct.c_void_p))[0], ct.POINTER(ct.c_void_p))
+        fn = ct.WINFUNCTYPE(ct.c_long, ct.c_void_p, *argtypes)(vtbl[index])
+        hr = fn(ptr, *args)
+        if hr < 0:
+            raise OSError(f"COM call failed {hr & 0xFFFFFFFF:#x}")
+        return hr
+
+    def _release(self, ptr) -> None:
+        if ptr:
+            try:
+                ct = self._ct
+                vtbl = ct.cast(ct.cast(ptr, ct.POINTER(ct.c_void_p))[0], ct.POINTER(ct.c_void_p))
+                ct.WINFUNCTYPE(ct.c_ulong, ct.c_void_p)(vtbl[2])(ptr)
+            except Exception:
+                pass
+
+    def _qi(self, ptr, iid_text: str):
+        ct = self._ct
+        out = ct.c_void_p()
+        iid = self._guid(iid_text)
+        self._call(ptr, 0, ct.byref(iid), ct.byref(out), argtypes=(ct.c_void_p, ct.c_void_p))
+        return out.value
+
+    # -- session discovery ------------------------------------------------------------
+    def _clear(self) -> None:
+        for m in self._meters:
+            self._release(m)
+        self._meters = []
+
+    def _refresh(self) -> None:
+        ct = self._ct
+        self._clear()
+        enum = dev = mgr = sessions = None
+        try:
+            enum_p = ct.c_void_p()
+            clsid, iid = self._guid(self._CLSID_MMDeviceEnumerator), self._guid(self._IID_IMMDeviceEnumerator)
+            hr = self._ole32.CoCreateInstance(ct.byref(clsid), None, 23, ct.byref(iid), ct.byref(enum_p))
+            if hr < 0 or not enum_p.value:
+                raise OSError("no MMDeviceEnumerator")
+            enum = enum_p.value
+            dev_p = ct.c_void_p()  # GetDefaultAudioEndpoint(eRender=0, eConsole=0)
+            self._call(enum, 4, 0, 0, ct.byref(dev_p), argtypes=(ct.c_int, ct.c_int, ct.c_void_p))
+            dev = dev_p.value
+            mgr_p = ct.c_void_p()
+            iid_mgr = self._guid(self._IID_IAudioSessionManager2)
+            self._call(dev, 3, ct.byref(iid_mgr), 23, None, ct.byref(mgr_p),  # IMMDevice::Activate
+                       argtypes=(ct.c_void_p, ct.c_ulong, ct.c_void_p, ct.c_void_p))
+            mgr = mgr_p.value
+            sess_p = ct.c_void_p()
+            self._call(mgr, 5, ct.byref(sess_p), argtypes=(ct.c_void_p,))  # GetSessionEnumerator
+            sessions = sess_p.value
+            count = ct.c_int(0)
+            self._call(sessions, 3, ct.byref(count), argtypes=(ct.c_void_p,))
+            me = os.getpid()
+            for i in range(count.value):
+                ctl_p = ct.c_void_p()
+                try:
+                    self._call(sessions, 4, i, ct.byref(ctl_p), argtypes=(ct.c_int, ct.c_void_p))
+                except OSError:
+                    continue
+                ctl = ctl_p.value
+                ctl2 = None
+                try:
+                    ctl2 = self._qi(ctl, self._IID_IAudioSessionControl2)
+                    pid = ct.c_ulong(0)
+                    try:
+                        self._call(ctl2, 14, ct.byref(pid), argtypes=(ct.c_void_p,))  # GetProcessId
+                    except OSError:
+                        continue
+                    if pid.value == me:
+                        self._meters.append(self._qi(ctl, self._IID_IAudioMeterInformation))
+                except OSError:
+                    pass
+                finally:
+                    self._release(ctl2)
+                    self._release(ctl)
+        finally:
+            for ptr in (sessions, mgr, dev, enum):
+                self._release(ptr)
+
+    def peak(self):
+        if not self._ok:
+            return None
+        ct = self._ct
+        try:
+            now = time.monotonic()
+            if now >= self._next_refresh:
+                self._next_refresh = now + self.REFRESH_S
+                self._refresh()
+            best = 0.0
+            for m in self._meters:
+                v = ct.c_float(0.0)
+                self._call(m, 3, ct.byref(v), argtypes=(ct.c_void_p,))  # GetPeakValue
+                best = max(best, float(v.value))
+            self._fails = 0
+            return best
+        except Exception:
+            self._clear()
+            self._fails += 1
+            if self._fails >= 5:  # keep failing: give up and use the buffer-activity fallback
+                self._ok = False
+            return None
+
+    def close(self) -> None:
+        if self._ok:
+            self._clear()
+
+
+class FeedAudioMonitor(QObject):
+    """Drives the meters of the main-wall tiles. ``feeds()`` returns [(tile, player), ...] of
+    live, unmuted feeds; the timer stops by itself when that list is empty."""
+
+    INTERVAL_MS = 120
+    SILENCE = 0.02      # peak below this counts as silence
+    HOLD_TICKS = 10     # ~1.2 s of silence (or no audio buffers) before the meter hides
+
+    def __init__(self, parent, feeds):
+        super().__init__(parent)
+        self._feeds = feeds
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._tick)
+        self._peak = None   # created on first use (COM setup only when a feed has sound)
+        self._state: dict = {}  # id(tile) -> [last played_abuffers, quiet ticks]
+        self._stats = None
+
+    def poke(self) -> None:
+        """Call when a feed starts / stops or is (un)muted."""
+        if not self._timer.isActive():
+            self._timer.start()
+            self._tick()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        if self._peak is not None:
+            self._peak.close()
+
+    def _played_buffers(self, player):
+        try:
+            import vlc
+            if self._stats is None:
+                self._stats = vlc.MediaStats()
+            media = player.get_media()
+            if media is None or not media.get_stats(self._stats):
+                return None
+            return int(self._stats.played_abuffers) + int(self._stats.decoded_audio)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _audible(player) -> bool:
+        try:
+            if player.audio_get_mute() is True:
+                return False
+            if player.audio_get_volume() == 0:
+                return False
+            return player.audio_get_track() != -1
+        except Exception:
+            return False
+
+    def _tick(self) -> None:
+        try:
+            feeds = list(self._feeds())
+        except Exception:
+            feeds = []
+        live_ids = {id(t) for t, _p in feeds}
+        for key in list(self._state):
+            if key not in live_ids:
+                del self._state[key]
+        if not feeds:
+            self._timer.stop()
+            return
+        if self._peak is None:
+            self._peak = _ProcessAudioPeak()
+        peak = self._peak.peak()
+        for tile, player in feeds:
+            st = self._state.setdefault(id(tile), [None, self.HOLD_TICKS])
+            count = self._played_buffers(player) if self._audible(player) else None
+            flowing = count is not None and st[0] is not None and count > st[0]
+            if count is not None:
+                st[0] = count
+            if peak is None:  # no Core Audio: show buffer activity with a gentle animation
+                level = (0.35 + 0.25 * ((time.monotonic() * 3.1 + id(tile) % 7) % 1.0)) if flowing else 0.0
+            else:
+                level = min(1.0, peak * 1.6) if flowing and peak >= self.SILENCE else 0.0
+            if level > 0.0:
+                st[1] = 0
+            else:
+                st[1] += 1
+            tile.set_audio_level(level if st[1] < self.HOLD_TICKS else None)
+
+
 class CameraTile(QFrame):
     """One feed on the wall: name/status strip, the native video widget VLC draws into,
     and a control bar (Play/Stop, Mute, Info). Strips sit outside the video widget so they
@@ -2377,6 +2670,7 @@ class CameraTile(QFrame):
         self.video.setObjectName("CctvVideo")
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.video.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self.video.setCursor(Qt.CursorShape.ArrowCursor)  # never inherit the edge-resize cursor
         layout.addWidget(self.video, 1)
         self.watermark = _TileCover(self.video)
         self.slot = slot
@@ -2388,6 +2682,7 @@ class CameraTile(QFrame):
         self.full_btn = None
         self.bar = None
         self.meta_lbl = None
+        self.meter = None
         if not compact:
             bar = QFrame()
             bar.setObjectName("CctvBar")
@@ -2405,6 +2700,10 @@ class CameraTile(QFrame):
             self.info_btn = self._ctl("Info", "info", "Who hosts this stream (ISP lookup)")
             row.addWidget(self.meta_lbl, 1)
             row.addWidget(self.play_btn)
+            if removable:  # main wall: live sound level next to Mute (FeedAudioMonitor)
+                self.meter = AudioLevelMeter()
+                self.meter.hide()
+                row.addWidget(self.meter, 0, Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(self.mute_btn)
             row.addWidget(self.info_btn)
             if removable:  # main wall: open one feed in its own full-screen window
@@ -2503,11 +2802,28 @@ class CameraTile(QFrame):
         for btn in (self.play_btn, self.mute_btn, self.info_btn, self.full_btn):
             if btn is not None:
                 btn.setVisible(visible)
+        if self.state != "live":
+            self.set_audio_level(None)
         if self.remove_btn is not None:  # any slot holding a camera can be cleared (also on error)
             self.remove_btn.setVisible(self.state != "empty" and self.state != "held")
 
+    def set_audio_level(self, level) -> None:
+        """``level`` 0..1, or None to hide the meter (muted, silent, not live)."""
+        if self.meter is None:
+            return
+        if level is None or self.state != "live" or getattr(self, "_muted", False):
+            if not self.meter.isHidden():
+                self.meter.hide()
+                self.meter.reset()
+            return
+        self.meter.set_level(level)
+        if self.meter.isHidden():
+            self.meter.show()
+
     def set_muted(self, muted: bool) -> None:
         self._muted = bool(muted)
+        if muted:
+            self.set_audio_level(None)
         if self.mute_btn is None:
             return
         self.mute_btn.setText("Muted" if muted else "Mute")
@@ -2758,7 +3074,7 @@ class CameraDialog(QDialog):
         brow.addWidget(self.banner_preview)
         bcol = QVBoxLayout()
         bcol.setSpacing(6)
-        self.banner_btn = QPushButton("Browse…")
+        self.banner_btn = QPushButton("Browse...")
         self.banner_btn.setObjectName("AcCyan")
         self.banner_btn.clicked.connect(self._browse_banner)
         self.banner_clear = QPushButton("Clear")
@@ -3119,6 +3435,13 @@ class WindowTitleBar(QFrame):
         super().__init__(window)
         self._win = window
         self._drag_from = None
+        # Resize-cursor bookkeeping. The cursor is set on the whole window, so children inherit
+        # it; VLC's native video child never reports MouseMove/Leave to Qt, so without the poll
+        # below a resize cursor could stay stuck (e.g. after going full screen from an edge).
+        self._edge_cursor = False
+        self._cursor_poll = QTimer(self)
+        self._cursor_poll.setInterval(60)
+        self._cursor_poll.timeout.connect(self._poll_edge_cursor)
         self.setObjectName("AppTitleBar")
         self.setFixedHeight(TITLEBAR_H)
         self.setStyleSheet(_TITLEBAR_STYLE)
@@ -3264,21 +3587,52 @@ class WindowTitleBar(QFrame):
             return Qt.CursorShape.SizeHorCursor
         return Qt.CursorShape.SizeVerCursor
 
+    def _set_edge_cursor(self, edges) -> None:
+        if edges:
+            self._win.setCursor(self._cursor_for(edges))
+            self._edge_cursor = True
+            if not self._cursor_poll.isActive():
+                self._cursor_poll.start()
+        else:
+            self._clear_edge_cursor()
+
+    def _clear_edge_cursor(self) -> None:
+        self._cursor_poll.stop()
+        if self._edge_cursor:
+            self._edge_cursor = False
+            self._win.unsetCursor()
+
+    def _poll_edge_cursor(self) -> None:
+        """Drop the resize cursor once the pointer is off the edge (works over native children)."""
+        win = self._win
+        if not self._edge_cursor or not win.isVisible():
+            self._clear_edge_cursor()
+            return
+        if QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            return  # a system resize is in progress
+        pos = win.mapFromGlobal(QCursor.pos())
+        if not win.rect().contains(pos):
+            self._clear_edge_cursor()
+            return
+        edges = self._edges_at(pos)
+        if edges:
+            win.setCursor(self._cursor_for(edges))
+        else:
+            self._clear_edge_cursor()
+
     def eventFilter(self, obj, event):
         if obj is self._win:
             kind = event.type()
             if kind == QEvent.Type.WindowStateChange:
+                self._clear_edge_cursor()
                 self._sync_state()
             elif kind == QEvent.Type.WindowTitleChange and self.title_lbl.textFormat() == Qt.TextFormat.PlainText:
                 self.title_lbl.setText(self._win.windowTitle())
             elif kind == QEvent.Type.MouseMove and not event.buttons():
-                edges = self._edges_at(event.position().toPoint())
-                if edges:
-                    self._win.setCursor(self._cursor_for(edges))
-                else:
-                    self._win.unsetCursor()
-            elif kind == QEvent.Type.Leave:
-                self._win.unsetCursor()
+                self._set_edge_cursor(self._edges_at(event.position().toPoint()))
+            elif kind in (QEvent.Type.Leave, QEvent.Type.Hide, QEvent.Type.Close,
+                          QEvent.Type.WindowDeactivate):
+                self._clear_edge_cursor()
             elif kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 edges = self._edges_at(event.position().toPoint())
                 handle = self._win.windowHandle()
@@ -3856,7 +4210,7 @@ class AddCctvDialog(QDialog):
         if not pairs:
             folder_missing = not catalog_available(source)
             sample = ('{"streams": [{"id": "uk-cam-1", "name": "London Bridge", "city": "London",\n'
-                      '  "rtsp": "rtsp://…", "banner": "banners/london.jpg"}]}')
+                      '  "rtsp": "rtsp://...", "banner": "banners/london.jpg"}]}')
             if folder_missing:
                 empty = _empty_state(
                     "No user_streams folder yet" if source == SOURCE_USER else "No streams catalog found",
@@ -4238,6 +4592,7 @@ class FeedFullscreenWindow(QWidget):
         self.video.setObjectName("CctvVideo")
         self.video.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.video.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
+        self.video.setCursor(Qt.CursorShape.ArrowCursor)  # never inherit the edge-resize cursor
         outer.addWidget(self.video, 1)
         self.cover = _TileCover(self.video)
         self.cover.set_banner(_camera_banner_path(cam))
@@ -4270,7 +4625,7 @@ class FeedFullscreenWindow(QWidget):
         self._start_timer = QTimer(self)
         self._start_timer.setSingleShot(True)
         self._start_timer.timeout.connect(self._start)
-        self._show_cover("ready", "Connecting…", str(cam.get("country") or ""))
+        self._show_cover("ready", "Connecting...", str(cam.get("country") or ""))
 
     # -- playback ---------------------------------------------------------------
     def start(self, delay_ms: int = 300) -> None:
@@ -4305,7 +4660,7 @@ class FeedFullscreenWindow(QWidget):
         self.pool.stop(self.key)  # release the failed player
         if self._attempt < 1:
             self._attempt += 1
-            self._show_cover("ready", "Connecting…", "Retrying")
+            self._show_cover("ready", "Connecting...", "Retrying")
             self.start(800)
             return
         self._show_cover("error", "Failed to connect")  # never the VLC error text or URL
@@ -4696,7 +5051,7 @@ class SettingsDialog(QDialog):
         w, lay = self._page("Updates", "Announcements and changelogs from DedSec. Loaded from the DedSec update "
                                        "server and checked against the app's signing key.")
         top = QHBoxLayout()
-        self.news_status = self._label("Loading…", "CardText")
+        self.news_status = self._label("Loading...", "CardText")
         top.addWidget(self.news_status, 1)
         self.news_btn = self._button("Refresh", "SettingsSecondary", self._load_news)
         top.addWidget(self.news_btn, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -4716,7 +5071,7 @@ class SettingsDialog(QDialog):
 
     def _load_news(self) -> None:
         self.news_btn.setEnabled(False)
-        self.news_status.setText("Checking for news…")
+        self.news_status.setText("Checking for news...")
 
         def done(result) -> None:
             if sip.isdeleted(self):
@@ -4850,16 +5205,46 @@ class SettingsDialog(QDialog):
 
         lay.addWidget(self._label("SECURITY", "SettingsGroup"))
         card, cl = self._card()
-        if user is not None and getattr(user, "totp_enabled", False):
+        method = getattr(user, "twofa_method", None) if user is not None else None
+        if method is None and user is not None and getattr(user, "totp_enabled", False):
+            method = "totp"
+        can = self.account is not None and user is not None
+        if method == "totp":
             badge = QLabel("● On")
             badge.setObjectName("OkBadge")
             cl.addWidget(self._row("Two-factor authentication (2FA)",
                                    "Sign-ins need a code from your authenticator app.", badge))
+            self.email2fa_btn = self._button("Use email codes...", "SettingsSecondary",
+                                             lambda: self._defer("setup_email_2fa"))
+            self.email2fa_btn.setEnabled(can)
+            cl.addWidget(self._row("Email codes instead",
+                                   "Switch to a 6-digit code emailed to you at each sign-in. "
+                                   "Needs a code from your authenticator app to confirm.", self.email2fa_btn))
+        elif method == "email":
+            badge = QLabel("● On (email)")
+            badge.setObjectName("OkBadge")
+            cl.addWidget(self._row("Two-factor authentication (2FA)",
+                                   "Sign-ins need a 6-digit code we email to you.", badge))
+            self.tfa_btn = self._button("Use an authenticator app...", "SettingsSecondary",
+                                        lambda: self._defer("setup_2fa"))
+            self.tfa_btn.setEnabled(can)
+            cl.addWidget(self._row("Authenticator app instead",
+                                   "Switch to codes from an authenticator app (stronger).", self.tfa_btn))
+            self.email2fa_btn = self._button("Turn off...", "SettingsDanger", lambda: self._defer("disable_email_2fa"))
+            self.email2fa_btn.setEnabled(can)
+            cl.addWidget(self._row("Turn off email codes",
+                                   "Confirm with a code we email you. Signs you out everywhere.", self.email2fa_btn))
         else:
-            self.tfa_btn = self._button("Set up 2FA…", "SettingsPrimary", lambda: self._defer("setup_2fa"))
-            self.tfa_btn.setEnabled(self.account is not None and user is not None)
+            self.tfa_btn = self._button("Set up 2FA...", "SettingsPrimary", lambda: self._defer("setup_2fa"))
+            self.tfa_btn.setEnabled(can)
             cl.addWidget(self._row("Two-factor authentication (2FA)",
                                    "Off. Add a code from an authenticator app to every sign-in.", self.tfa_btn))
+            self.email2fa_btn = self._button("Use email codes...", "SettingsSecondary",
+                                             lambda: self._defer("setup_email_2fa"))
+            self.email2fa_btn.setEnabled(can)
+            cl.addWidget(self._row("Or: codes by email",
+                                   "No authenticator app? Get a 6-digit code by email at each sign-in.",
+                                   self.email2fa_btn))
         lay.addWidget(card)
 
         lay.addWidget(self._label("EMAIL", "SettingsGroup"))
@@ -4986,7 +5371,7 @@ class SettingsDialog(QDialog):
 
     def _check_updates(self) -> None:
         self.update_btn.setEnabled(False)
-        self.update_status.setText("Checking for updates…")
+        self.update_status.setText("Checking for updates...")
 
         def done(info) -> None:
             global _UPDATE_DIALOG
@@ -5236,8 +5621,10 @@ class CctvPage(QWidget):
         foot.addWidget(engine)
         root.addLayout(foot)
 
+        self._audio = FeedAudioMonitor(self, self._audio_feeds)
         self._clock = QTimer(self)
         self._clock.timeout.connect(self._tick)
+        self._clock.timeout.connect(self._audio_check)
         self._clock.start(1000)
         self._tick()
 
@@ -5469,6 +5856,24 @@ class CctvPage(QWidget):
             except Exception:
                 pass
         self.tiles[index].set_muted(checked)
+        self._audio_check()
+
+    def _audio_feeds(self) -> list:
+        """(tile, player) of main-wall feeds that are live and unmuted (for the sound meters)."""
+        if self._closing or self._wall is not None:
+            return []
+        out = []
+        for i, tile in enumerate(self.tiles):
+            if tile.meter is None or tile.state != "live" or getattr(tile, "_muted", False):
+                continue
+            player = self.pool._players.get(f"wall-{i}")
+            if player is not None:
+                out.append((tile, player))
+        return out
+
+    def _audio_check(self) -> None:
+        if self._audio_feeds():
+            self._audio.poke()
 
     def show_info(self, index: int) -> None:
         cam = self._pinned[index] if index < len(getattr(self, "_pinned", [])) else None
@@ -5667,6 +6072,7 @@ class CctvPage(QWidget):
         self._closing = True
         try:
             self._clock.stop()
+            self._audio.stop()
         except Exception:
             pass
         for tile in self.tiles:
@@ -5953,8 +6359,10 @@ def _friendly_error(exc, action: str = "") -> str:
                     "locked for 15 minutes.")
         if status == 401 and action == "devconfirm":
             return "That reset code is wrong or has expired. Check the email, or send a new code."
-        if status == 401 and action in ("totp", "enable2fa"):
+        if status == 401 and action in ("totp", "enable2fa", "email2fa"):
             return "That code is wrong or has expired. Enter the current 6-digit code."
+        if status == 401 and action == "resetcode":
+            return "That code is wrong or has expired. Check the email, or send a new code."
         if status == 401:
             return "Your session has expired. Please sign in again."
         if status == 403 and "another pc" in detail.lower():
@@ -6016,11 +6424,13 @@ class AuthScreen(QWidget):
     """Account gate that replaces the old local LockScreen.
 
     Modes: restore (silent session resume), sign-in, create account, verify email,
-    two-factor code, and an optional "secure your account" offer after sign-in.
+    two-factor code (authenticator or emailed), an optional "secure your account" offer after
+    sign-in, device reset, and forgot password (email -> emailed code -> reset link by email).
     ``on_authenticated(user)`` is called after a successful sign-in *and* VPN check.
     """
 
-    MODE_SIGNIN, MODE_SIGNUP, MODE_VERIFY, MODE_TOTP, MODE_BUSY, MODE_OFFER, MODE_DEVICE = range(7)
+    (MODE_SIGNIN, MODE_SIGNUP, MODE_VERIFY, MODE_TOTP, MODE_BUSY, MODE_OFFER, MODE_DEVICE,
+     MODE_FORGOT, MODE_FORGOT_CODE) = range(9)
 
     def __init__(self, on_authenticated, try_restore: bool = True, notice: str = ""):
         super().__init__()
@@ -6036,6 +6446,8 @@ class AuthScreen(QWidget):
         self._saved_pw = None  # password prefilled from the OS keyring (to detect it going stale)
         self._used_saved_pw = False
         self._device_pending = ("", "")  # (email, password) while moving the account to this PC
+        self._reset_email = ""  # address of the forgot-password flow in progress
+        self._totp_method = "totp"  # "totp" (authenticator) or "email" for the pending challenge
         threading.Thread(target=_read_public_ip, daemon=True).start()
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
@@ -6081,6 +6493,8 @@ class AuthScreen(QWidget):
         self.stack.addWidget(self._build_busy())
         self.stack.addWidget(self._build_offer())
         self.stack.addWidget(self._build_device())
+        self.stack.addWidget(self._build_forgot())
+        self.stack.addWidget(self._build_forgot_code())
         lay.addWidget(self.stack, 1)
         self.err = QLabel("")
         self.err.setObjectName("AuthErr")
@@ -6137,7 +6551,7 @@ class AuthScreen(QWidget):
                 btn.setEnabled(False)
         elif try_restore:
             self.set_mode(self.MODE_BUSY)
-            self.busy_label.setText("Restoring your session…")
+            self.busy_label.setText("Restoring your session...")
             run_bg(self._restore_job, self._restore_ok, self._restore_failed)
         else:
             self.set_mode(self.MODE_SIGNIN)
@@ -6224,6 +6638,8 @@ class AuthScreen(QWidget):
         lay.addWidget(self.remember_hint)
         lay.addSpacing(2)
         lay.addWidget(self.signin_btn)
+        self.forgot_link = self._link("Forgot password?", self._goto_forgot)
+        lay.addWidget(self.forgot_link)
         lay.addWidget(self._link("Have a verification code? Enter it here", self._goto_verify))
         lay.addWidget(self._link("Join our Discord", open_discord))
         lay.addStretch(1)
@@ -6277,13 +6693,16 @@ class AuthScreen(QWidget):
         lay.addSpacing(6)
         lay.addWidget(self.verify_btn)
         lay.addWidget(self.resend_btn)
+        self.change_email_btn = self._link("Wrong email? Go back and change it", self._back_to_signup)
+        lay.addWidget(self.change_email_btn)
         lay.addWidget(self._link("Already clicked the link in the email? Sign in", lambda: self.set_mode(self.MODE_SIGNIN)))
         lay.addStretch(1)
         return page
 
     def _build_totp(self) -> QWidget:
         page, lay = self._page()
-        lay.addWidget(self._label("Two-factor authentication is on.\nEnter the 6-digit code from your authenticator app."))
+        self.totp_hint = self._label("Two-factor authentication is on.\nEnter the 6-digit code from your authenticator app.")
+        lay.addWidget(self.totp_hint)
         self.code = QLineEdit()
         self.code.setPlaceholderText("000000")
         self.code.setMaxLength(6)
@@ -6293,6 +6712,48 @@ class AuthScreen(QWidget):
         lay.addWidget(self.code)
         lay.addSpacing(6)
         lay.addWidget(self.totp_btn)
+        self.totp_resend = self._link("Didn't get it? Send a new code", self._do_login_code_resend)
+        self.totp_resend.setVisible(False)
+        lay.addWidget(self.totp_resend)
+        lay.addWidget(self._link("Back to sign in", lambda: self.set_mode(self.MODE_SIGNIN)))
+        lay.addStretch(1)
+        return page
+
+    def _set_totp_method(self, method: str) -> None:
+        self._totp_method = "email" if method == "email" else "totp"
+        if self._totp_method == "email":
+            self.totp_hint.setText("Two-factor authentication is on.\nEnter the 6-digit code we just emailed you.")
+        else:
+            self.totp_hint.setText("Two-factor authentication is on.\nEnter the 6-digit code from your authenticator app.")
+        self.totp_resend.setVisible(self._totp_method == "email")
+
+    def _build_forgot(self) -> QWidget:
+        page, lay = self._page()
+        lay.addWidget(self._label("Enter your account email. We'll send you a 6-digit code to confirm it's you."))
+        self.fp_email = self._field("Email")
+        self.fp_email.returnPressed.connect(self._do_forgot)
+        self.fp_btn = self._primary("Send code", self._do_forgot)
+        lay.addWidget(self.fp_email)
+        lay.addSpacing(6)
+        lay.addWidget(self.fp_btn)
+        lay.addWidget(self._link("Back to sign in", lambda: self.set_mode(self.MODE_SIGNIN)))
+        lay.addStretch(1)
+        return page
+
+    def _build_forgot_code(self) -> QWidget:
+        page, lay = self._page()
+        self.fpc_hint = self._label("Enter the 6-digit code from the email.")
+        self.fpc_code = CodeLineEdit("6-digit code")
+        self.fpc_code.setObjectName("LockCode")
+        self.fpc_code.returnPressed.connect(self._do_forgot_code)
+        self.fpc_btn = self._primary("Continue", self._do_forgot_code)
+        self.fpc_resend = self._link("Didn't get it? Send a new code", self._do_forgot_resend)
+        lay.addWidget(self.fpc_hint)
+        lay.addWidget(self.fpc_code)
+        lay.addSpacing(6)
+        lay.addWidget(self.fpc_btn)
+        lay.addWidget(self.fpc_resend)
+        lay.addWidget(self._link("Use a different email", lambda: self.set_mode(self.MODE_FORGOT)))
         lay.addWidget(self._link("Back to sign in", lambda: self.set_mode(self.MODE_SIGNIN)))
         lay.addStretch(1)
         return page
@@ -6300,7 +6761,7 @@ class AuthScreen(QWidget):
     def _build_busy(self) -> QWidget:
         page, lay = self._page()
         lay.addStretch(1)
-        self.busy_label = self._label("Please wait…")
+        self.busy_label = self._label("Please wait...")
         self.busy_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self.busy_label)
         lay.addStretch(2)
@@ -6310,10 +6771,13 @@ class AuthScreen(QWidget):
         page, lay = self._page()
         lay.addWidget(self._label("Protect your account with two-factor authentication. "
                                   "You'll scan a QR code with an authenticator app (Google Authenticator, "
-                                  "Aegis, Authy…) and enter a 6-digit code when you sign in."))
+                                  "Aegis, Authy...) and enter a 6-digit code when you sign in."))
         lay.addSpacing(6)
         self.offer_btn = self._primary("Set up 2FA", self._do_offer_setup)
         lay.addWidget(self.offer_btn)
+        self.offer_email_btn = self._link("No authenticator app? Use codes sent by email instead",
+                                          self._do_offer_email)
+        lay.addWidget(self.offer_email_btn)
         lay.addWidget(self._link("Not now, continue to the app", self._finish))
         lay.addStretch(1)
         return page
@@ -6350,6 +6814,8 @@ class AuthScreen(QWidget):
         self.tab_signin.setChecked(mode == self.MODE_SIGNIN)
         self.tab_signup.setChecked(mode == self.MODE_SIGNUP)
         self.tabs_box.setVisible(mode in (self.MODE_SIGNIN, self.MODE_SIGNUP))
+        if mode != self.MODE_TOTP:
+            self.code.clear()
         titles = {
             self.MODE_SIGNIN: ("Welcome back", "Sign in to your DedSec CCTV account"),
             self.MODE_SIGNUP: ("Create account", "One account for your DedSec CCTV"),
@@ -6358,6 +6824,8 @@ class AuthScreen(QWidget):
             self.MODE_BUSY: ("Welcome back", "Unlock your DedSec CCTV"),
             self.MODE_OFFER: ("Secure account", "Optional, but recommended"),
             self.MODE_DEVICE: ("Device locked", "This account is linked to another PC"),
+            self.MODE_FORGOT: ("Reset password", "We'll help you get back in"),
+            self.MODE_FORGOT_CODE: ("Reset password", "Check your email"),
         }
         t, s = titles[mode]
         self.title.setText(t)
@@ -6366,7 +6834,8 @@ class AuthScreen(QWidget):
         self._show_info("")
         focus = {self.MODE_SIGNIN: self.si_email if not self.si_email.text() else self.si_pw,
                  self.MODE_SIGNUP: self.su_email, self.MODE_VERIFY: self.verify_code,
-                 self.MODE_TOTP: self.code,
+                 self.MODE_TOTP: self.code, self.MODE_FORGOT: self.fp_email,
+                 self.MODE_FORGOT_CODE: self.fpc_code,
                  self.MODE_DEVICE: self.dev_code if self.dev_code.isVisible() else self.dev_request_btn}.get(mode)
         if focus is not None:
             focus.setFocus()
@@ -6383,7 +6852,9 @@ class AuthScreen(QWidget):
         self._busy = busy
         for w in (self.signin_btn, self.signup_btn, self.verify_btn, self.totp_btn, self.offer_btn,
                   self.resend_btn, self.tab_signin, self.tab_signup, self.remember, self.forget_btn,
-                  self.dev_request_btn, self.dev_confirm_btn, self.dev_resend):
+                  self.dev_request_btn, self.dev_confirm_btn, self.dev_resend, self.forgot_link,
+                  self.change_email_btn, self.totp_resend, self.offer_email_btn, self.fp_btn,
+                  self.fpc_btn, self.fpc_resend):
             w.setEnabled(not busy)
         if button is not None:
             if busy:
@@ -6468,7 +6939,7 @@ class AuthScreen(QWidget):
                             "It expires in 15 minutes.")
 
         button = self.dev_request_btn if self.dev_request_btn.isVisible() else self.dev_resend
-        self._run(button, "Sending…", lambda: client.request_device_reset(email, pw), ok, "devreset")
+        self._run(button, "Sending...", lambda: client.request_device_reset(email, pw), ok, "devreset")
 
     def _do_device_confirm(self) -> None:
         code = "".join(ch for ch in self.dev_code.text() if ch.isdigit())
@@ -6482,8 +6953,8 @@ class AuthScreen(QWidget):
             client.confirm_device_reset(email, code)
             try:  # continue straight to sign-in on this (now linked) PC
                 return self._with_vpn_check(client.login(email, pw))
-            except TotpRequired:
-                return "totp"
+            except TotpRequired as exc:
+                return "totp-email" if exc.method == "email" else "totp"
             except AuthError:
                 return "reset"
 
@@ -6493,8 +6964,8 @@ class AuthScreen(QWidget):
             if result == "reset":
                 self.set_mode(self.MODE_SIGNIN)
                 self._show_info("Device reset. This PC is now linked to your account. Sign in to continue.")
-            elif result == "totp":
-                self.code.clear()
+            elif result in ("totp", "totp-email"):
+                self._set_totp_method("email" if result == "totp-email" else "totp")
                 self.set_mode(self.MODE_TOTP)
                 self._show_info("Device reset. Enter your 2FA code to finish signing in.")
             else:
@@ -6502,7 +6973,7 @@ class AuthScreen(QWidget):
                 self.si_pw.clear()
                 self._authenticated(result, offer_2fa=True)
 
-        self._run(self.dev_confirm_btn, "Checking…", job, ok, "devconfirm")
+        self._run(self.dev_confirm_btn, "Checking...", job, ok, "devconfirm")
 
     # -- jobs (run on worker threads; no widget access in here) ---------------
     @staticmethod
@@ -6612,20 +7083,20 @@ class AuthScreen(QWidget):
         def job():
             try:
                 user = client.login(email, pw)
-            except TotpRequired:
-                return "totp"
+            except TotpRequired as exc:
+                return "totp-email" if exc.method == "email" else "totp"
             return self._with_vpn_check(user)
 
         def ok(result):
-            if result == "totp":
-                self.code.clear()
+            if result in ("totp", "totp-email"):
+                self._set_totp_method("email" if result == "totp-email" else "totp")
                 self.set_mode(self.MODE_TOTP)
                 return
             self._apply_remember()
             self.si_pw.clear()
             self._authenticated(result, offer_2fa=True)
 
-        self._run(self.signin_btn, "Signing in…", job, ok, "login")
+        self._run(self.signin_btn, "Signing in...", job, ok, "login")
 
     def _do_totp(self) -> None:
         code = "".join(ch for ch in self.code.text() if ch.isdigit())
@@ -6640,7 +7111,7 @@ class AuthScreen(QWidget):
             self.si_pw.clear()
             self._authenticated(user, offer_2fa=False)
 
-        self._run(self.totp_btn, "Checking…", lambda: self._with_vpn_check(client.submit_totp(code)), ok, "totp")
+        self._run(self.totp_btn, "Checking...", lambda: self._with_vpn_check(client.submit_totp(code)), ok, "totp")
 
     def _do_signup(self) -> None:
         email, pw, pw2 = self.su_email.text().strip(), self.su_pw.text(), self.su_pw2.text()
@@ -6667,7 +7138,78 @@ class AuthScreen(QWidget):
             self.set_mode(self.MODE_VERIFY)
             self.verify_hint.setText(f"Check your email ({email}) for a verification code, then paste it below.")
 
-        self._run(self.signup_btn, "Creating account…", lambda: client.register(email, pw, self.su_updates.isChecked(), terms_accepted=True), ok, "register")
+        self._run(self.signup_btn, "Creating account...", lambda: client.register(email, pw, self.su_updates.isChecked(), terms_accepted=True), ok, "register")
+
+    def _do_login_code_resend(self) -> None:
+        client = auth_client()
+        self._run(self.totp_btn, "Sending...", client.resend_login_code,
+                  lambda _m: self._show_info("A new code is on its way. It expires in 10 minutes."), "totp")
+
+    # -- forgot password -------------------------------------------------------
+    def _goto_forgot(self) -> None:
+        if not self.fp_email.text().strip():
+            self.fp_email.setText(self.si_email.text().strip())
+        self.set_mode(self.MODE_FORGOT)
+
+    def _do_forgot(self) -> None:
+        email = self.fp_email.text().strip()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            self._show_error("Enter a valid email address.")
+            return
+        client = auth_client()
+
+        def ok(_msg):
+            self._reset_email = email
+            self.fpc_code.clear()
+            self.fpc_hint.setText(f"If an account exists for {email}, we've emailed it a 6-digit code. "
+                                  "Enter it below. It expires in 10 minutes.")
+            self.set_mode(self.MODE_FORGOT_CODE)
+
+        self._run(self.fp_btn, "Sending...", lambda: client.forgot_password(email), ok, "forgot")
+
+    def _do_forgot_resend(self) -> None:
+        email = self._reset_email
+        if not email:
+            self.set_mode(self.MODE_FORGOT)
+            return
+        client = auth_client()
+        self._run(self.fpc_resend, "Sending...", lambda: client.forgot_password(email),
+                  lambda _m: self._show_info("If the account exists, a new code is on its way."), "forgot")
+
+    def _do_forgot_code(self) -> None:
+        code = self.fpc_code.code()
+        if len(code) != 6:
+            self._show_error("Enter the 6-digit code from the email.")
+            return
+        email = self._reset_email
+        client = auth_client()
+
+        def ok(_msg):
+            self.fpc_code.clear()
+            self._reset_email = ""
+            self.set_mode(self.MODE_SIGNIN)
+            self.si_email.setText(email)
+            self.si_pw.clear()
+            self._show_info(f"We've emailed a password reset link to {email}. Open it to choose a new "
+                            "password (it works once and expires in 15 minutes), then sign in here.")
+
+        self._run(self.fpc_btn, "Checking...", lambda: client.verify_reset_code(email, code), ok, "resetcode")
+
+    # -- sign-up verification ---------------------------------------------------
+    def _back_to_signup(self) -> None:
+        """From the verify screen: go back to the sign-up form to fix a mistyped address."""
+        email, _pw = self._pending
+        self._pending = ("", "")
+        self.verify_code.clear()
+        if email:
+            self.su_email.setText(email)
+        self.su_pw.clear()
+        self.su_pw2.clear()
+        self.set_mode(self.MODE_SIGNUP)
+        self.su_email.setFocus()
+        self.su_email.selectAll()
+        self._show_info("Fix your email address and create the account again. "
+                        "An account that is never verified is not used.")
 
     def _goto_verify(self) -> None:
         self.verify_hint.setText("Check your email for a verification code, then paste it below.")
@@ -6688,8 +7230,8 @@ class AuthScreen(QWidget):
                 return "verified"
             try:  # sign straight in with the credentials just entered
                 return self._with_vpn_check(client.login(email, pw))
-            except TotpRequired:
-                return "totp"
+            except TotpRequired as exc:
+                return "totp-email" if exc.method == "email" else "totp"
             except AuthError:
                 return "verified"
 
@@ -6699,14 +7241,15 @@ class AuthScreen(QWidget):
             if result == "verified":
                 self.set_mode(self.MODE_SIGNIN)
                 self._show_info("Email verified. You can sign in now.")
-            elif result == "totp":
+            elif result in ("totp", "totp-email"):
+                self._set_totp_method("email" if result == "totp-email" else "totp")
                 self.set_mode(self.MODE_TOTP)
             else:
                 if self._remember_pending and self._remember_pending[:2] == (email, pw):
                     self._apply_remember()
                 self._authenticated(result, offer_2fa=True)
 
-        self._run(self.verify_btn, "Verifying…", job, ok, "verify")
+        self._run(self.verify_btn, "Verifying...", job, ok, "verify")
 
     def _do_resend(self) -> None:
         email, pw = self._pending
@@ -6715,7 +7258,7 @@ class AuthScreen(QWidget):
             self._show_info("Enter your email and password again to get a new code.")
             return
         client = auth_client()
-        self._run(self.verify_btn, "Sending…", lambda: client.register(email, pw),
+        self._run(self.verify_btn, "Sending...", lambda: client.register(email, pw),
                   lambda _m: self._show_info("A new code is on its way (if the account isn't verified yet)."),
                   "register")
 
@@ -6727,6 +7270,13 @@ class AuthScreen(QWidget):
             self.set_mode(self.MODE_SIGNIN)
             self._show_info("Two-factor authentication is on. Sign in again and enter your code.")
 
+    def _do_offer_email(self) -> None:
+        dlg = EmailTwoFactorDialog(self, enable=True, totp_on=False)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.si_pw.clear()
+            self.set_mode(self.MODE_SIGNIN)
+            self._show_info("Email two-factor is on. Sign in again and enter the code we email you.")
+
     def _authenticated(self, user, offer_2fa: bool) -> None:
         if self._closing:
             return
@@ -6734,7 +7284,7 @@ class AuthScreen(QWidget):
             self._block_and_close()
             return
         self._user = user
-        if offer_2fa and user is not None and not user.totp_enabled:
+        if offer_2fa and user is not None and not user.has_2fa:
             self.set_mode(self.MODE_OFFER)
             return
         self._finish()
@@ -6828,7 +7378,7 @@ class TwoFactorSetupDialog(QDialog):
         title = QLabel("Two-factor setup")
         title.setObjectName("LockWelcome")
         title.setStyleSheet("font-size: 26px;")
-        self.hint = QLabel("Preparing your QR code…")
+        self.hint = QLabel("Preparing your QR code...")
         self.hint.setObjectName("LockLabel")
         self.hint.setWordWrap(True)
         self.qr = QLabel()
@@ -6917,7 +7467,7 @@ class TwoFactorSetupDialog(QDialog):
             return
         self._busy = True
         self.enable_btn.setEnabled(False)
-        self.enable_btn.setText("Enabling…")
+        self.enable_btn.setText("Enabling...")
         self.err.setText("")
         client = auth_client()
         run_bg(lambda: client.enable_2fa(code), self._enabled, self._enable_failed)
@@ -6937,6 +7487,140 @@ class TwoFactorSetupDialog(QDialog):
         self.enable_btn.setText("Enable 2FA")
         self.code.clear()
         self.err.setText(_friendly_error(exc, "enable2fa"))
+
+    def reject(self) -> None:
+        if not self._busy:
+            super().reject()
+
+
+class EmailTwoFactorDialog(QDialog):
+    """Turn email 2FA on (enable=True) or off. Accepted => changed (all sessions were ended).
+
+    Turning it on while the authenticator app is the 2FA method also asks for an authenticator
+    code, so a stolen session alone can't downgrade the account."""
+
+    def __init__(self, parent=None, enable: bool = True, totp_on: bool = False):
+        super().__init__(parent)
+        self._enable_mode = enable
+        self._totp_on = enable and totp_on
+        self.setWindowTitle("Email two-factor codes")
+        self.setModal(True)
+        self.setFixedWidth(500)
+        icon = _asset("dedsec_logo.ico", "dedsec_logo.png", "applogo.png")
+        if icon:
+            self.setWindowIcon(QIcon(str(icon)))
+        self.setStyleSheet("QDialog { background: #0a1624; }" + _AUTH_STYLE)
+        self._busy = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(30, 26, 30, 24)
+        lay.setSpacing(10)
+        title = QLabel("Email codes" if enable else "Turn off email codes")
+        title.setObjectName("LockWelcome")
+        title.setStyleSheet("font-size: 26px;")
+        if enable:
+            text = ("Each sign-in will need a 6-digit code we email to your account address. "
+                    "First confirm you can receive them: send a code and enter it below.")
+            if self._totp_on:
+                text += " This replaces your authenticator app, so enter a code from it too."
+        else:
+            text = ("Sign-ins will then need only your password. "
+                    "Send a code to your email and enter it below to confirm.")
+        hint = QLabel(text)
+        hint.setObjectName("LockLabel")
+        hint.setWordWrap(True)
+        self.send_btn = QPushButton("Send code")
+        self.send_btn.setObjectName("AuthLink")
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_btn.clicked.connect(self._send)
+        self.code = CodeLineEdit("Code from the email")
+        self.code.setObjectName("AuthField")
+        self.code.returnPressed.connect(self._submit)
+        self.totp = QLineEdit()
+        self.totp.setObjectName("AuthField")
+        self.totp.setPlaceholderText("Code from your authenticator app")
+        self.totp.setMaxLength(6)
+        self.totp.setVisible(self._totp_on)
+        self.totp.returnPressed.connect(self._submit)
+        self.info = QLabel("")
+        self.info.setObjectName("AuthInfo")
+        self.info.setWordWrap(True)
+        self.err = QLabel("")
+        self.err.setObjectName("AuthErr")
+        self.err.setWordWrap(True)
+        self.ok_btn = QPushButton("Turn on" if enable else "Turn off")
+        self.ok_btn.setObjectName("LockButton")
+        self.ok_btn.setMinimumHeight(46)
+        self.ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ok_btn.clicked.connect(self._submit)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("AuthLink")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.clicked.connect(self.reject)
+        lay.addWidget(title)
+        lay.addWidget(hint)
+        lay.addWidget(self.send_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.code)
+        lay.addWidget(self.totp)
+        lay.addWidget(self.info)
+        lay.addWidget(self.err)
+        lay.addWidget(self.ok_btn)
+        lay.addWidget(cancel, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.send_btn.setEnabled(not busy)
+        self.ok_btn.setEnabled(not busy)
+
+    def _send(self) -> None:
+        if self._busy:
+            return
+        self._set_busy(True)
+        self.err.setText("")
+        client = auth_client()
+        purpose = "enable" if self._enable_mode else "disable"
+
+        def ok(_msg):
+            self._set_busy(False)
+            self.send_btn.setText("Send a new code")
+            self.info.setText("A 6-digit code is on its way to your email. It expires in 10 minutes.")
+            self.code.setFocus()
+
+        def err(exc):
+            self._set_busy(False)
+            self.err.setText(_friendly_error(exc, "email2fa"))
+
+        run_bg(lambda: client.send_email_2fa_code(purpose), ok, err)
+
+    def _submit(self) -> None:
+        if self._busy:
+            return
+        code = self.code.code()
+        if len(code) != 6:
+            self.err.setText("Enter the 6-digit code from the email (use Send code first).")
+            return
+        totp = "".join(ch for ch in self.totp.text() if ch.isdigit())
+        if self._totp_on and len(totp) != 6:
+            self.err.setText("Enter the current 6-digit code from your authenticator app.")
+            return
+        self._set_busy(True)
+        self.err.setText("")
+        client = auth_client()
+        if self._enable_mode:
+            job = lambda: client.enable_email_2fa(code, totp or None)
+        else:
+            job = lambda: client.disable_email_2fa(code)
+
+        def ok(_v):
+            self._busy = False
+            self.accept()
+
+        def err(exc):
+            self._set_busy(False)
+            self.code.clear()
+            self.totp.clear()
+            self.err.setText(_friendly_error(exc, "email2fa"))
+
+        run_bg(job, ok, err)
 
     def reject(self) -> None:
         if not self._busy:
@@ -7006,6 +7690,21 @@ class CctvApp(QWidget):
             self.user = None
             self._show_auth(notice="Two-factor authentication is on. Sign in again and enter your code.")
 
+    def setup_email_2fa(self) -> None:
+        totp_on = bool(getattr(self.user, "totp_enabled", False))
+        dlg = EmailTwoFactorDialog(self, enable=True, totp_on=totp_on)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._close_page()
+            self.user = None
+            self._show_auth(notice="Email two-factor is on. Sign in again and enter the code we email you.")
+
+    def disable_email_2fa(self) -> None:
+        dlg = EmailTwoFactorDialog(self, enable=False)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._close_page()
+            self.user = None
+            self._show_auth(notice="Email two-factor is off. Sign in again.")
+
     def shutdown(self) -> None:
         """Stop all feeds; safe to call repeatedly (closeEvent, aboutToQuit, update quit)."""
         if self.page is not None and not sip.isdeleted(self.page):
@@ -7046,6 +7745,12 @@ def _vlc_installer_visible() -> bool:
 
 
 def _relaunch() -> None:
+    if _is_compiled():  # a build: start the exe itself (sys.executable may not be the app exe)
+        exe = Path(sys.argv[0]).resolve() if sys.argv and sys.argv[0] else install_dir() / "DedSecCCTV.exe"
+        if exe.suffix.lower() != ".exe" or not exe.is_file():
+            exe = install_dir() / "DedSecCCTV.exe"
+        subprocess.Popen([str(exe)], cwd=str(exe.parent))
+        os._exit(0)
     target = Path(sys.argv[0]) if sys.argv else Path(__file__)
     if not target.is_file():
         target = Path(__file__)
@@ -7166,8 +7871,10 @@ def is_newer_version(remote: str, current: str = APP_VERSION) -> bool:
 
 
 class UpdateInfo:
-    def __init__(self, version: str, url: str, sha256: str, mandatory: bool = True, notes: str = ""):
+    def __init__(self, version: str, url: str, sha256: str, mandatory: bool = True, notes: str = "",
+                 size: int = 0):
         self.version, self.url, self.sha256, self.mandatory, self.notes = version, url, sha256, mandatory, notes
+        self.size = size  # bytes, from the signed manifest's optional "size" field; display only (0 = unknown)
 
     def __repr__(self) -> str:
         return f"UpdateInfo({self.version!r}, {self.url!r}, mandatory={self.mandatory})"
@@ -7206,7 +7913,9 @@ def parse_latest(data, current: str = APP_VERSION, base: str = UPDATE_BASE_URL):
     url = resolve_update_url(data.get("url") or "DedSecCCTV.zip", base)
     mandatory = data.get("mandatory", True)
     mandatory = mandatory if isinstance(mandatory, bool) else str(mandatory).lower() not in ("false", "0", "no")
-    return UpdateInfo(version, url, sha, mandatory, str(data.get("notes") or "")[:2000])
+    size = data.get("size", 0)
+    size = size if isinstance(size, int) and not isinstance(size, bool) and 0 < size <= UPDATE_MAX_BYTES else 0
+    return UpdateInfo(version, url, sha, mandatory, str(data.get("notes") or "")[:2000], size)
 
 
 def _update_public_key():
@@ -7468,11 +8177,23 @@ def install_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def bundled_updater(target: Path | None = None) -> Path | None:
+    """The updater shipped inside the app (assets/updater/DedSecUpdater.bin), else the legacy
+    <install>/DedSecUpdater.exe from 1.0.2 and older installs. None if neither exists."""
+    target = target or install_dir()
+    for cand in (target.joinpath(*UPDATER_BUNDLED), target / UPDATER_EXE_NAME):
+        if cand.is_file() and cand.stat().st_size > 0:
+            return cand
+    return None
+
+
 def updater_command(zip_path, sha256: str, pid: int | None = None, workdir=None) -> list:
-    """Copy the updater out of the install folder (so it can itself be replaced) and build its argv."""
+    """Copy the updater out of the install folder (so it can itself be replaced) and build its argv.
+
+    The copy in %TEMP% is always named DedSecUpdater.exe, whatever the bundled file is called."""
     target = install_dir()
     workdir = Path(workdir or tempfile.mkdtemp(prefix="dedsec-updater-"))
-    exe = target / UPDATER_EXE_NAME
+    exe = bundled_updater(target) if sys.platform == "win32" else None
     script = target / UPDATER_SCRIPT_NAME
     pid = os.getpid() if pid is None else pid
     if _is_compiled():
@@ -7483,17 +8204,16 @@ def updater_command(zip_path, sha256: str, pid: int | None = None, workdir=None)
         launch = [str(cand)]
     else:
         launch = [str(Path(__file__).resolve())]
-    if exe.is_file() and sys.platform == "win32":
+    if exe is not None and (_is_compiled() or not script.is_file()):
         copy = workdir / UPDATER_EXE_NAME
-        shutil.copy2(exe, copy)
+        shutil.copyfile(exe, copy)  # copyfile: no hidden/read-only attributes carried over
         cmd = [str(copy)]
     elif script.is_file() and not _is_compiled():
         copy = workdir / UPDATER_SCRIPT_NAME
         shutil.copy2(script, copy)
         cmd = [sys.executable, str(copy), "--python", sys.executable]
     else:
-        raise UpdateError(f"{UPDATER_EXE_NAME if _is_compiled() else UPDATER_SCRIPT_NAME} is missing "
-                          f"from {target}. Reinstall DedSec CCTV.")
+        raise UpdateError("the updater is missing from this install. Reinstall DedSec CCTV.")
     return cmd + ["--pid", str(pid), "--zip", str(zip_path), "--sha256", sha256,
                   "--target", str(target), "--launch", launch[0]]
 
@@ -7530,87 +8250,207 @@ class _DownloadWorker(QObject):
             self.finished.emit(path)
 
 
+def _fmt_bytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+# Standard Windows installer look (like the Inno Setup wizard): white header strip with the logo,
+# light body, Segoe UI, native-style buttons and progress bar. Not routed through the app theme
+# (_dsNoTheme) so it stays light whatever theme the app uses.
+_UPDATE_DIALOG_STYLE = """
+    QDialog#UpdDialog { background: #f0f0f0; }
+    QWidget { font-family: "Segoe UI"; font-size: 9pt; color: #1b1b1b; }
+    QFrame#UpdHeader { background: #fdfdfd; border: 0; border-bottom: 1px solid #d9d9d9; }
+    QLabel#UpdTitle { font-size: 12pt; font-weight: 600; background: transparent; }
+    QLabel#UpdSub { color: #444444; background: transparent; }
+    QLabel#UpdBadge { color: #9d5d00; font-weight: 600; background: transparent; }
+    QLabel#UpdInfo { background: transparent; }
+    QLabel#UpdInfoVal { font-weight: 600; background: transparent; }
+    QTextBrowser#UpdNotes { background: #fdfdfd; border: 1px solid #a0a0a0; padding: 4px; }
+    QProgressBar#UpdBar { background: #e6e6e6; border: 1px solid #bcbcbc; border-radius: 0; text-align: center;
+        min-height: 18px; max-height: 18px; color: #1b1b1b; }
+    QProgressBar#UpdBar::chunk { background: #06b025; }
+    QLabel#UpdErr { color: #c42b1c; background: transparent; }
+    QLabel#UpdOk { color: #0f7b0f; background: transparent; }
+    QFrame#UpdSep { background: #d9d9d9; border: 0; max-height: 1px; min-height: 1px; }
+    QPushButton { background: #fdfdfd; border: 1px solid #adadad; border-radius: 3px; min-width: 80px;
+        min-height: 23px; padding: 0 12px; }
+    QPushButton:hover { background: #e5f1fb; border-color: #0078d4; }
+    QPushButton:pressed { background: #cce4f7; }
+    QPushButton:disabled { color: #9a9a9a; background: #f4f4f4; border-color: #cfcfcf; }
+    QPushButton:default { border: 2px solid #0078d4; }
+    QPushButton#UpdLink { background: transparent; border: 0; color: #0067c0; min-width: 0; padding: 0 4px; }
+    QPushButton#UpdLink:hover { text-decoration: underline; }
+"""
+
+
 class UpdateDialog(QDialog):
-    """"New update available" prompt. Mandatory updates can't be dismissed."""
+    """"Update available" prompt in a standard Windows installer style. Mandatory updates can't be dismissed.
+
+    The app downloads and verifies the zip (signed manifest -> SHA-256 -> zip check) exactly as in
+    1.0.3, then hands it to the updater, which shows its own progress window while it installs."""
 
     def __init__(self, info: UpdateInfo, parent=None):
         super().__init__(parent)
         self.info = info
         self._worker = None
         self._busy = False
-        self.setWindowTitle("DedSec CCTV update")
+        self.setObjectName("UpdDialog")
+        self.setWindowTitle("DedSec CCTV Update")
         self.setModal(True)
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setFixedSize(500, 300)
-        if info.mandatory:
-            self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint
-                                | Qt.WindowType.WindowTitleHint)
+        self.setFixedSize(520, 440)
         icon = _asset("dedsec_logo.ico", "dedsec_logo.png", "applogo.png")
         if icon:
             self.setWindowIcon(QIcon(str(icon)))
-        self.setStyleSheet("QDialog { background: #0a1624; } QProgressBar { background: #08141f; color: #e8f0ff; "
-                           "border: 1px solid #1d4e68; border-radius: 8px; text-align: center; height: 18px; } "
-                           "QProgressBar::chunk { background: #22d3ee; border-radius: 7px; }" + _AUTH_STYLE)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(28, 22, 28, 20)
-        lay.setSpacing(10)
-        title = QLabel("New update available")
-        title.setObjectName("LockWelcome")
-        title.setStyleSheet("font-size: 24px;")
-        text = f"DedSec CCTV {info.version} is available (you have {APP_VERSION})."
-        if info.mandatory:
-            text += " This update is required to keep using the app."
-        msg = QLabel(text)
-        msg.setObjectName("LockLabel")
-        msg.setWordWrap(True)
-        notes = QLabel(info.notes)
-        notes.setObjectName("AuthHint")
-        notes.setWordWrap(True)
-        notes.setVisible(bool(info.notes))
+        pal = QPalette()
+        for role, col in ((QPalette.ColorRole.Window, "#f0f0f0"), (QPalette.ColorRole.Base, "#fdfdfd"),
+                          (QPalette.ColorRole.Button, "#fdfdfd"), (QPalette.ColorRole.WindowText, "#1b1b1b"),
+                          (QPalette.ColorRole.Text, "#1b1b1b"), (QPalette.ColorRole.ButtonText, "#1b1b1b")):
+            pal.setColor(role, QColor(col))
+        self.setPalette(pal)
+        self.setProperty("_dsNoTheme", True)
+        self.setStyleSheet(_UPDATE_DIALOG_STYLE)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        header = QFrame()
+        header.setObjectName("UpdHeader")
+        header.setFixedHeight(64)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(18, 8, 14, 8)
+        hl.setSpacing(12)
+        htxt = QVBoxLayout()
+        htxt.setSpacing(2)
+        trow = QHBoxLayout()
+        trow.setSpacing(8)
+        title = QLabel("A new version of DedSec CCTV is available")
+        title.setObjectName("UpdTitle")
+        trow.addWidget(title)
+        self.badge = QLabel("(required)")
+        self.badge.setObjectName("UpdBadge")
+        trow.addWidget(self.badge)
+        trow.addStretch(1)
+        htxt.addLayout(trow)
+        self.sub = QLabel()
+        self.sub.setObjectName("UpdSub")
+        htxt.addWidget(self.sub)
+        hl.addLayout(htxt, 1)
+        logo = QLabel()
+        pix = _logo_pixmap(44)
+        if not pix.isNull():
+            logo.setPixmap(pix)
+        logo.setFixedSize(48, 48)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hl.addWidget(logo, 0, Qt.AlignmentFlag.AlignVCenter)
+        root.addWidget(header)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(22, 14, 22, 10)
+        body.setSpacing(8)
+        root.addLayout(body, 1)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        self.size_lbl = QLabel(_fmt_bytes(info.size) if info.size else "Unknown")
+        for r, (cap, val) in enumerate((("Current version:", QLabel(APP_VERSION)),
+                                        ("New version:", QLabel(info.version)),
+                                        ("Download size:", self.size_lbl))):
+            c = QLabel(cap)
+            c.setObjectName("UpdInfo")
+            val.setObjectName("UpdInfoVal")
+            grid.addWidget(c, r, 0)
+            grid.addWidget(val, r, 1)
+        grid.setColumnStretch(2, 1)
+        body.addLayout(grid)
+        sec = QLabel("Release notes:")
+        sec.setObjectName("UpdInfo")
+        body.addSpacing(4)
+        body.addWidget(sec)
+        self.notes = QTextBrowser()
+        self.notes.setObjectName("UpdNotes")
+        self.notes.setOpenLinks(False)  # notes are plain text; never open links from them
+        self.notes.setPlainText(info.notes.strip() or "No release notes for this version.")
+        body.addWidget(self.notes, 1)
         self.bar = QProgressBar()
+        self.bar.setObjectName("UpdBar")
         self.bar.setVisible(False)
+        body.addWidget(self.bar)
         self.status = QLabel("")
-        self.status.setObjectName("AuthErr")
+        self.status.setObjectName("UpdErr")
         self.status.setWordWrap(True)
-        self.download_btn = QPushButton("Download now")
-        self.download_btn.setObjectName("LockButton")
-        self.download_btn.setMinimumHeight(44)
-        self.download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.download_btn.clicked.connect(self._start)
+        self.status.setVisible(False)
+        body.addWidget(self.status)
+
+        sep = QFrame()
+        sep.setObjectName("UpdSep")
+        root.addWidget(sep)
         row = QHBoxLayout()
-        self.later_btn = QPushButton("Later")
-        self.later_btn.setObjectName("AuthLink")
-        self.later_btn.clicked.connect(self.reject)
-        self.later_btn.setVisible(not info.mandatory)
+        row.setContentsMargins(14, 10, 14, 12)
+        row.setSpacing(8)
         self.quit_btn = QPushButton("Quit")
-        self.quit_btn.setObjectName("AuthLink")
+        self.quit_btn.setAutoDefault(False)
         self.quit_btn.clicked.connect(lambda: os._exit(0))
-        self.quit_btn.setVisible(info.mandatory)
         self.web_btn = QPushButton("Download page")
-        self.web_btn.setObjectName("AuthLink")
+        self.web_btn.setObjectName("UpdLink")
+        self.web_btn.setAutoDefault(False)
+        self.web_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.web_btn.setToolTip(GITHUB_RELEASES_URL)
         self.web_btn.clicked.connect(lambda: open_url(GITHUB_RELEASES_URL))
-        self.web_btn.setVisible(info.mandatory)
-        row.addWidget(self.later_btn)
-        row.addWidget(self.quit_btn)
         row.addWidget(self.web_btn)
         row.addStretch(1)
-        lay.addWidget(title)
-        lay.addWidget(msg)
-        lay.addWidget(notes)
-        lay.addStretch(1)
-        lay.addWidget(self.bar)
-        lay.addWidget(self.status)
-        lay.addWidget(self.download_btn)
-        lay.addLayout(row)
+        self.download_btn = QPushButton("Update now")
+        self.download_btn.setDefault(True)
+        self.download_btn.clicked.connect(self._start)
+        row.addWidget(self.download_btn)
+        self.later_btn = QPushButton("Later")
+        self.later_btn.setAutoDefault(False)
+        self.later_btn.clicked.connect(self.reject)
+        row.addWidget(self.later_btn)
+        row.addWidget(self.quit_btn)
+        root.addLayout(row)
+        self._apply_mode()
 
+    # -- mandatory / optional ---------------------------------------------------
+    def _apply_mode(self) -> None:
+        m = bool(self.info.mandatory)
+        # Native title bar (gets a taskbar button). Mandatory: no close button in the title bar.
+        flags = Qt.WindowType.Window | Qt.WindowType.WindowTitleHint | Qt.WindowType.CustomizeWindowHint
+        flags |= Qt.WindowType.WindowSystemMenuHint
+        if not m:
+            flags |= Qt.WindowType.WindowCloseButtonHint
+        visible = self.isVisible()
+        self.setWindowFlags(flags)
+        if visible:
+            self.show()
+        self.badge.setVisible(m)
+        self.later_btn.setVisible(not m)
+        self.quit_btn.setVisible(m)
+        self.web_btn.setVisible(m)
+        if m:
+            self.sub.setText(f"Version {self.info.version} is required to keep using the app.")
+        else:
+            self.sub.setText(f"Version {self.info.version} is ready to install. The app restarts when it's done.")
+
+    def set_mandatory(self) -> None:
+        self.info.mandatory = True
+        self._apply_mode()
+
+    # -- download (unchanged verification: download_update checks URL, size, SHA-256, zip) ----
     def _start(self) -> None:
         if self._busy:
             return
         self._busy = True
         self.download_btn.setEnabled(False)
-        self.download_btn.setText("Downloading…")
+        self.download_btn.setText("Downloading\u2026")
         self.later_btn.setEnabled(False)
+        self.status.setVisible(False)
         self.status.setText("")
         self.bar.setVisible(True)
         self.bar.setRange(0, 0)
@@ -7621,34 +8461,46 @@ class UpdateDialog(QDialog):
         self._worker.start()
 
     def _progress(self, done, total) -> None:
+        total = total or self.info.size
         if total:
+            if not self.info.size:
+                self.size_lbl.setText(_fmt_bytes(total))
             self.bar.setRange(0, 1000)
-            self.bar.setValue(int(done * 1000 / total))
-            self.bar.setFormat(f"{done / 1048576:.1f} / {total / 1048576:.1f} MB")
+            self.bar.setValue(min(1000, int(done * 1000 / total)))
+            self.bar.setFormat(f"{min(100, done * 100 // total)}%  ({_fmt_bytes(done)} of {_fmt_bytes(total)})")
         else:
-            self.bar.setFormat(f"{done / 1048576:.1f} MB")
+            self.bar.setFormat(_fmt_bytes(done))
 
     def _downloaded(self, path) -> None:
-        self.download_btn.setText("Installing…")
+        self.download_btn.setText("Installing\u2026")
         self.bar.setRange(0, 1000)
         self.bar.setValue(1000)
+        self.bar.setFormat("Download verified")
         try:
             launch_updater(path, self.info.sha256)
         except Exception as exc:
             self._failed(exc)
             return
-        self.status.setStyleSheet("color: #7dffb0;")
+        self.status.setStyleSheet("color: #0f7b0f;")
         self.status.setText("Installing the update. DedSec CCTV will restart in a moment.")
+        self.status.setVisible(True)
         QTimer.singleShot(600, _quit_for_update)
 
     def _failed(self, exc) -> None:
         self._busy = False
         self.bar.setVisible(False)
         self.download_btn.setEnabled(True)
-        self.download_btn.setText("Retry download")
+        self.download_btn.setText("Retry")
         self.later_btn.setEnabled(True)
         reason = str(exc) if isinstance(exc, UpdateError) else _friendly_update_error(exc)
+        self.status.setStyleSheet("")
         self.status.setText(f"Update failed: {reason}")
+        self.status.setVisible(True)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and (self.info.mandatory or self._busy):
+            return
+        super().keyPressEvent(event)
 
     def reject(self) -> None:  # Esc / Later / close button
         if self.info.mandatory or self._busy:
@@ -7739,10 +8591,7 @@ def handle_update_required(parent=None) -> None:
     global _UPDATE_REQUIRED_ACTIVE
     if _UPDATE_DIALOG is not None and (_UPDATE_DIALOG.info.mandatory or _UPDATE_DIALOG.isVisible()):
         dlg = _UPDATE_DIALOG  # start-up check already found the update: make it non-dismissable
-        dlg.info.mandatory = True
-        dlg.later_btn.setVisible(False)
-        dlg.quit_btn.setVisible(True)
-        dlg.web_btn.setVisible(True)
+        dlg.set_mandatory()
         _show_update_dialog(dlg.info)
         return
     if _UPDATE_REQUIRED_ACTIVE:
@@ -7762,6 +8611,41 @@ def handle_update_required(parent=None) -> None:
         _show_update_dialog(info, parent)
 
     run_bg(check_for_update, found, lambda _exc: _update_required_fallback(parent))
+
+
+def cleanup_after_update() -> None:
+    """Run once after start (background thread). Best effort, never raises.
+
+    * 1.0.2 -> 1.0.3: the 1.0.2 updater copied the new files in but never deletes anything, so the old
+      <install>/DedSecUpdater.exe is still in the install root. The bundled copy replaces it, so remove
+      it (hide it if Windows won't let us delete it right now; the next start tries again).
+    * Keep the installer's "installed version" (Apps & features, and the setup's downgrade check) in
+      step with an auto-updated app.
+    """
+    if not _is_compiled() or sys.platform != "win32":
+        return
+    target = install_dir()
+    legacy = target / UPDATER_EXE_NAME
+    try:
+        if legacy.is_file() and target.joinpath(*UPDATER_BUNDLED).is_file():
+            try:
+                legacy.unlink()
+            except OSError:
+                import ctypes
+                ctypes.windll.kernel32.SetFileAttributesW(str(legacy), 0x2)  # FILE_ATTRIBUTE_HIDDEN
+    except Exception:
+        pass
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INNO_UNINSTALL_KEY, 0,
+                            winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as key:
+            have, _kind = winreg.QueryValueEx(key, "DisplayVersion")
+            loc, _kind = winreg.QueryValueEx(key, "InstallLocation")
+            same = Path(str(loc)).resolve() == target  # only the install this exe belongs to
+            if same and is_newer_version(APP_VERSION, str(have)):
+                winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, APP_VERSION)
+    except Exception:
+        pass
 
 
 _INSTANCE_MUTEX = None
@@ -7790,6 +8674,7 @@ def main():
     app.aboutToQuit.connect(window.shutdown)
     window.showMaximized()
     start_update_check(window)
+    threading.Thread(target=cleanup_after_update, daemon=True).start()
     rc = app.exec()
     window.shutdown()
     _exit_cleanly(app, window, rc)

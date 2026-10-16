@@ -14,6 +14,8 @@ from .db import init_db
 from .routes.auth import router as auth_router
 from .routes.email_prefs import router as email_prefs_router
 from .routes.net import router as net_router
+from .routes.password_reset import api as password_reset_router
+from .routes.password_reset import page as password_reset_page
 
 logging.basicConfig(level=logging.INFO)
 
@@ -75,6 +77,8 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(email_prefs_router)
     app.include_router(net_router)
+    app.include_router(password_reset_router)
+    app.include_router(password_reset_page)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

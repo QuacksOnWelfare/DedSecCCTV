@@ -95,15 +95,17 @@ Missing $exe
 Build the app first from the source folder:
   python build.py
 
-Optional (recommended for auto-update):
-  python -m nuitka --onefile --windows-console-mode=disable --output-filename=DedSecUpdater.exe updater.py
-  copy DedSecUpdater.exe DedSecCCTV\
+python build.py also builds the updater and bundles it as DedSecCCTV\assets\updater\DedSecUpdater.bin.
 "@
 }
 
-$updater = Join-Path $DistDir 'DedSecUpdater.exe'
+$updater = Join-Path $DistDir 'assets\updater\DedSecUpdater.bin'
 if (-not (Test-Path -LiteralPath $updater)) {
-    Write-Warning "DedSecUpdater.exe not found in $DistDir - auto-update will not work until it is shipped next to DedSecCCTV.exe."
+    Write-Warning "assets\updater\DedSecUpdater.bin not found in $DistDir - auto-update will not work. Build with: python build.py"
+}
+$legacyUpdater = Join-Path $DistDir 'DedSecUpdater.exe'
+if (Test-Path -LiteralPath $legacyUpdater) {
+    Write-Warning "DedSecUpdater.exe is in the root of $DistDir - since 1.0.3 it should only be bundled under assets\updater."
 }
 
 # version.inc - used when ISCC is invoked without /DAppVersion

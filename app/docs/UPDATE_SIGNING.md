@@ -27,7 +27,7 @@ Note: users on builds from before this change don't check signatures. They need 
 
 ## 4. Sign the release (on your PC)
     python tools\sign_update.py sign --key %USERPROFILE%\dedsec-signing\update_signing_key.pem ^
-        --zip DedSecCCTV.zip --version 1.0.2 --notes "What changed"
+        --zip DedSecCCTV.zip --version 1.0.3 --notes "What changed"
     python tools\sign_update.py verify --pub <PUBLIC_KEY> --dir .
 This writes `latest.json` and `latest.json.sig` next to the zip. Add `--optional` for a non-mandatory update.
 Do not edit `latest.json` after signing, or the signature breaks and the app ignores the update.
