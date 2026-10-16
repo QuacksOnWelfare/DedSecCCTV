@@ -313,6 +313,132 @@ def save_setting(key: str, value) -> None:
 # App version (semver). Bump it for every release you publish; see UPDATES.md.
 # ---------------------------------------------------------------------------
 APP_VERSION = "1.0.3"
+
+
+# ---------------------------------------------------------------------------
+# Crash safety net (1.0.3 hotfix)
+# PyQt6 calls qFatal() (abort, 0xc0000409 in Qt6Core.dll) on any Python exception that escapes a
+# slot or a virtual override while sys.excepthook is the default one. Installing our own hook makes
+# PyQt6 call it and carry on instead. Tracebacks go to <install>/crashlogs/crash.log (fallback
+# %APPDATA%/DedSecCctv/crashlogs), rotated at 1 MB; native crashes go to faulthandler.log there.
+# Privacy: only tracebacks (no local variables) are written, and credentials / tokens in the text
+# (URL user:password@, password=/token=/key= values, Bearer headers, JWT-like strings) are masked.
+# ---------------------------------------------------------------------------
+CRASH_LOG_MAX = 1024 * 1024
+_CRASH_DIR = None
+_FAULT_FILE = None
+_CRASH_LOCK = threading.Lock()
+_REDACT = [
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@'\"]*:[^/\s@'\"]*@"), r"\1***:***@"),
+    (re.compile(r"(?i)\b(pass(?:word|wd)?|pwd|token|access_token|refresh_token|secret|api[_-]?key|key|auth|"
+                r"session|cookie|code|totp|otp|sig(?:nature)?)\b(\s*[=:]\s*|['\"]\s*:\s*['\"]?)([^\s&,'\"}]+)"),
+     r"\1\2***"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+"), r"\1 ***"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"), "***jwt***"),
+]
+
+
+def _redact(text: str) -> str:
+    for rx, rep in _REDACT:
+        text = rx.sub(rep, text)
+    return text
+
+
+def _crash_dir():
+    """<install>/crashlogs if writable, else %APPDATA%/DedSecCctv/crashlogs; None if neither works."""
+    global _CRASH_DIR
+    if _CRASH_DIR is not None:
+        return _CRASH_DIR
+    compiled = bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+    exe_dir = Path(sys.executable).resolve().parent if compiled else Path(__file__).resolve().parent
+    appdata = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "DedSecCctv"
+    for cand in (exe_dir / "crashlogs", appdata / "crashlogs"):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".write-test"
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("ok")
+            probe.unlink()
+            _CRASH_DIR = cand
+            return cand
+        except OSError:
+            continue
+    return None
+
+
+def write_crash_log(title: str, text: str) -> None:
+    """Append a redacted entry to crash.log (rotates to crash.log.1 at 1 MB). Never raises."""
+    try:
+        folder = _crash_dir()
+        if folder is None:
+            return
+        path = folder / "crash.log"
+        with _CRASH_LOCK:
+            try:
+                if path.stat().st_size > CRASH_LOG_MAX:
+                    os.replace(path, folder / "crash.log.1")
+            except OSError:
+                pass
+            entry = (f"==== {time.strftime('%Y-%m-%d %H:%M:%S')} {title} | DedSecCCTV {APP_VERSION} | "
+                     f"{sys.platform} | thread {threading.current_thread().name}\n{_redact(text).rstrip()}\n\n")
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(entry)
+    except Exception:
+        pass
+
+
+def _excepthook(exc_type, exc, tb) -> None:
+    if issubclass(exc_type, KeyboardInterrupt):
+        return sys.__excepthook__(exc_type, exc, tb)
+    import traceback
+    write_crash_log("Unhandled exception (app kept running)",
+                    "".join(traceback.format_exception(exc_type, exc, tb)))
+
+
+def _thread_excepthook(args) -> None:
+    if args.exc_type is SystemExit:
+        return
+    import traceback
+    write_crash_log(f"Unhandled exception in thread {getattr(args.thread, 'name', '?')}",
+                    "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
+
+
+def install_crash_handlers() -> None:
+    """Call once, first thing in main(). Safe to call again."""
+    global _FAULT_FILE
+    sys.excepthook = _excepthook          # PyQt6: hook is called instead of qFatal()
+    threading.excepthook = _thread_excepthook
+    try:
+        import faulthandler
+        folder = _crash_dir()
+        if folder is not None and _FAULT_FILE is None:
+            fpath = folder / "faulthandler.log"
+            try:
+                if fpath.stat().st_size > CRASH_LOG_MAX:
+                    os.replace(fpath, folder / "faulthandler.log.1")
+            except OSError:
+                pass
+            _FAULT_FILE = open(fpath, "a", encoding="utf-8")  # must stay open for faulthandler
+            _FAULT_FILE.write(f"---- session {time.strftime('%Y-%m-%d %H:%M:%S')} DedSecCCTV {APP_VERSION}\n")
+            _FAULT_FILE.flush()
+            faulthandler.enable(file=_FAULT_FILE, all_threads=True)
+    except Exception:
+        pass
+
+
+def _guarded(fn):
+    """Decorator for Qt slots on the wall / player paths: log and swallow instead of aborting."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            import traceback
+            write_crash_log(f"Exception in {fn.__qualname__} (handled)", traceback.format_exc())
+            return None
+    return wrapper
 # Auto-update: static files served by Caddy on the same VPS (never the API). Only HTTPS, and only
 # files under this folder are ever downloaded; the zip's SHA-256 must match latest.json.
 def _load_app_config() -> dict:
@@ -1134,6 +1260,9 @@ class _PoolBridge(QObject):
 # released (releasing a player that is still stopping is a use-after-free inside libvlc)
 # and main() exits with os._exit so interpreter teardown can't race the VLC threads.
 _ABANDONED_PLAYERS: list = []
+# python-vlc event managers (and with them the ctypes callback thunks libvlc calls) of abandoned
+# players: kept alive for the rest of the process, since libvlc may still call into them.
+_ABANDONED_EVENT_MGRS: list = []
 
 CONNECT_TIMEOUT_MS = 15_000   # a feed that has not reached Playing by then counts as failed
 _WATCH_MS = 1_000             # state poll interval while a feed is connecting
@@ -1161,6 +1290,8 @@ class VlcPool:
       have stopped, before the video widgets are destroyed."""
 
     _reapers: list = []  # class-wide: main() checks these before interpreter teardown
+    _event_keep: dict = {}  # id(player) -> EventManager, held until that player is released
+    _reaping: set = set()   # id(player) of players already handed to a reaper (never release twice)
 
     def __init__(self):
         self._players = {}
@@ -1172,6 +1303,11 @@ class VlcPool:
         self._watch_timers = {}
         self._fail_handlers = {}   # key -> callable(), fired at most once per play() on the UI thread
         self._started = {}         # key -> monotonic start of the current play()
+        # key -> (player, EventManager). player.event_manager() returns a NEW Python wrapper on every
+        # call, and that wrapper owns the ctypes callback thunk libvlc calls. It must be kept alive
+        # while the callbacks are attached and be the same object used to detach them; otherwise the
+        # GC frees the thunk while libvlc still calls it (hard crash) and detach silently does nothing.
+        self._event_mgrs = {}
         self._alive = True
         self._bridge = _PoolBridge()
         self._bridge.resolved.connect(self._on_resolved)
@@ -1187,6 +1323,7 @@ class VlcPool:
         _web_headers(media, url)
         return media
 
+    @_guarded
     def _reload_clip(self, key: str, url: str, player) -> None:
         if not self._alive or self._players.get(key) is not player or not self._instance:
             self._stop_timer(self._clip_timers, key)
@@ -1261,6 +1398,7 @@ class VlcPool:
         except Exception:
             return False
 
+    @_guarded
     def _on_resolved(self, key: str, token: int, url: str) -> None:
         if not self._alive or self._tokens.get(key) != token:
             return
@@ -1299,11 +1437,20 @@ class VlcPool:
         """VLC fires these on its own threads: only emit a queued Qt signal from them."""
         try:
             import vlc
-            em = player.event_manager()
+            held = self._event_mgrs.get(key)
+            if held is not None and held[0] is player:
+                em = held[1]
+            else:
+                if held is not None:
+                    self._unhook_events(held[1])
+                em = player.event_manager()
+                self._event_mgrs[key] = (player, em)
             bridge = self._bridge
 
             def emit(kind, k=key, t=token):
-                try:
+                if not self._alive:
+                    return
+                try:  # queued (cross-thread) signal: the slot runs on the GUI thread
                     bridge.vlc_event.emit(k, t, kind)
                 except RuntimeError:  # bridge gone (shutdown)
                     pass
@@ -1318,10 +1465,12 @@ class VlcPool:
             pass  # state polling in _watch still catches failures
 
     @staticmethod
-    def _unhook_events(player) -> None:
+    def _unhook_events(em) -> None:
+        """Detach with the SAME EventManager wrapper the callbacks were attached on."""
+        if em is None:
+            return
         try:
             import vlc
-            em = player.event_manager()
             for etype in (vlc.EventType.MediaPlayerEncounteredError, vlc.EventType.MediaPlayerPlaying):
                 try:
                     em.event_detach(etype)
@@ -1330,6 +1479,7 @@ class VlcPool:
         except Exception:
             pass
 
+    @_guarded
     def _on_vlc_event(self, key: str, token: int, kind: str) -> None:
         if not self._alive or self._tokens.get(key) != token or key not in self._fail_handlers:
             return  # stale event from a player that was stopped / replaced
@@ -1339,6 +1489,7 @@ class VlcPool:
         elif kind == "error":
             self._fail(key, token)
 
+    @_guarded
     def _watch(self, key: str, token: int) -> None:
         if not self._alive or self._tokens.get(key) != token:
             self._stop_timer(self._watch_timers, key)
@@ -1365,6 +1516,7 @@ class VlcPool:
             except Exception:
                 pass
 
+    @_guarded
     def _kick_audio(self, key: str, player) -> None:
         self._kick_timers.pop(key, None)
         if not self._alive or self._players.get(key) is not player:
@@ -1386,8 +1538,12 @@ class VlcPool:
         self._tokens.pop(key, None)
         self._widgets.pop(key, None)
         player = self._players.pop(key, None)
-        if player is not None:
-            self._unhook_events(player)
+        held = self._event_mgrs.pop(key, None)
+        if held is not None:
+            self._unhook_events(held[1])
+            if player is not None and held[0] is player:
+                # keep the wrapper (and its thunk) alive until the player is released
+                VlcPool._event_keep[id(player)] = held[1]
         return player
 
     @staticmethod
@@ -1396,7 +1552,12 @@ class VlcPool:
         while a stream is still connecting). Returns the threads."""
         threads = []
         for player in players:
-            def work(pl=player):
+            if player is None or id(player) in VlcPool._reaping:
+                continue  # already being stopped / released
+            VlcPool._reaping.add(id(player))
+            em = VlcPool._event_keep.pop(id(player), None)
+
+            def work(pl=player, em=em):
                 try:
                     pl.stop()
                 except Exception:
@@ -1411,8 +1572,12 @@ class VlcPool:
                     pl.release()
                 except Exception:
                     pass
+                # em (the event wrapper) is dropped only now, after release; the id stays in
+                # _reaping while pl is referenced here, so it can't be reused for another player.
+                VlcPool._reaping.discard(id(pl))
             t = threading.Thread(target=work, daemon=True, name="vlc-stop")
             t.player = player
+            t.em = em
             t.start()
             threads.append(t)
             VlcPool._reapers.append(t)
@@ -1432,6 +1597,8 @@ class VlcPool:
         left = [t for t in threads if t.is_alive()]
         for t in left:
             _ABANDONED_PLAYERS.append(t.player)
+            if getattr(t, "em", None) is not None:
+                _ABANDONED_EVENT_MGRS.append(t.em)
         return not left
 
     def stop(self, key: str) -> None:
@@ -2591,6 +2758,7 @@ class FeedAudioMonitor(QObject):
         except Exception:
             return False
 
+    @_guarded
     def _tick(self) -> None:
         try:
             feeds = list(self._feeds())
@@ -2607,6 +2775,8 @@ class FeedAudioMonitor(QObject):
             self._peak = _ProcessAudioPeak()
         peak = self._peak.peak()
         for tile, player in feeds:
+            if tile is None or player is None or sip.isdeleted(tile):
+                continue
             st = self._state.setdefault(id(tile), [None, self.HOLD_TICKS])
             count = self._played_buffers(player) if self._audible(player) else None
             flowing = count is not None and st[0] is not None and count > st[0]
@@ -5779,6 +5949,7 @@ class CctvPage(QWidget):
         """What a slot is showing; a change of address means its player must restart."""
         return (cam.get("id"), cam.get("rtsp")) if cam else None
 
+    @_guarded
     def refresh(self) -> None:
         """Sync the wall with the pinned cameras *in place*.
 
@@ -5848,6 +6019,7 @@ class CctvPage(QWidget):
         if tile.full_btn is not None:
             tile.full_btn.clicked.connect(lambda _=False, i=index: self.open_feed_fullscreen(i))
 
+    @_guarded
     def toggle_mute(self, index: int, checked: bool) -> None:
         player = self.pool._players.get(f"wall-{index}")
         if player:
@@ -5871,6 +6043,7 @@ class CctvPage(QWidget):
                 out.append((tile, player))
         return out
 
+    @_guarded
     def _audio_check(self) -> None:
         if self._audio_feeds():
             self._audio.poke()
@@ -5881,18 +6054,20 @@ class CctvPage(QWidget):
             return
         show_stream_info(self, cam.get("rtsp", ""), str(cam.get("country") or ""), str(cam.get("country_code") or ""))
 
+    @_guarded
     def remove_from_wall(self, index: int) -> None:
         """Tile 'Remove': stop that feed and take it off the wall. The camera stays saved in the
         list (same as WallFullDialog). Only this slot is cleared; other tiles keep playing untouched."""
         if self._wall is not None or self._closing:
             return
         cam = self._pinned[index] if index < len(getattr(self, "_pinned", [])) else None
-        if not cam:
-            return
+        if not cam or not cam.get("pinned"):
+            return  # empty slot / already taken off the wall (removal is idempotent)
         self._cancel_fail_timers(cam_id=cam.get("id"))
         cam["pinned"] = False
         self.save_and_refresh()  # persist; refresh() clears just this slot (stops only its player)
 
+    @_guarded
     def toggle_play(self, index: int) -> None:
         if self._wall is not None or self._closing:
             return
@@ -5952,6 +6127,7 @@ class CctvPage(QWidget):
                 except RuntimeError:
                     pass
 
+    @_guarded
     def _wall_feed_failed(self, index: int, cam_id) -> None:
         if self._closing or self._wall is not None or self._index_of(cam_id) != index:
             return  # tile changed / removed / app closing meanwhile
@@ -5962,6 +6138,7 @@ class CctvPage(QWidget):
             self._attempts[cam_id] = 1
             tile.show_live()  # stays on "CONNECTING" while the fresh attempt starts
 
+            @_guarded
             def retry(c=cam_id):
                 self._fail_timers.pop(("retry", c), None)
                 i = self._index_of(c)  # the wall may have been re-laid meanwhile
@@ -5975,6 +6152,7 @@ class CctvPage(QWidget):
             self._fail_timer("drop", cam_id, 3000, lambda c=cam_id: self._drop_failed(c))
         self._update_status()
 
+    @_guarded
     def _drop_failed(self, cam_id) -> None:
         self._fail_timers.pop(("drop", cam_id), None)
         if self._closing or self._wall is not None:
@@ -8664,6 +8842,7 @@ def _create_instance_mutex() -> None:
 
 
 def main():
+    install_crash_handlers()
     _create_instance_mutex()
     app = QApplication(sys.argv)
     _ensure_vlc(app)

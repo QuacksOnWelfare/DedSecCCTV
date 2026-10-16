@@ -44,7 +44,7 @@ import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
-PRESERVE_DIRS = ("streams",)          # existing files here are never overwritten
+PRESERVE_DIRS = ("streams", "crashlogs")  # existing files here are never overwritten (crashlogs: app crash logs)
 LEGACY_UPDATER = "DedSecUpdater.exe"   # install-root updater of 1.0.2 and older
 BUNDLED_UPDATER = ("assets", "updater", "DedSecUpdater.bin")
 # Set by a Nuitka onefile bootstrap (this updater); must not leak into the app we start.
